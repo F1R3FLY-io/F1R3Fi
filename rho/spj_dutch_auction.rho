@@ -1,0 +1,481 @@
+// ============================================================
+// Dutch Auction via SPJ Contract Combinators in Rholang
+// ============================================================
+//
+// A Dutch auction starts at a high ask price and drops at
+// regular block intervals. The first bidder to accept at the
+// current price wins. If no bidder accepts before the reserve
+// price window expires, the auction fails.
+//
+// SPJ FRAMING
+// -----------
+// The auction is a fold over a descending price schedule:
+//
+//   auction([(t1,p1),(t2,p2),...,(tN,pN)]) =
+//     step(t1,p1) `or` step(t2,p2) `or` ... `or` zero
+//
+//   step(t, p) =
+//     truncate(t+interval, get(t, give(one(p))))   -- seller gets p
+//     `cand`
+//     get(t, assetTransfer)                         -- buyer gets asset
+//
+// SPJ's `or` is holder-chooses (European-style choice). Dutch
+// auctions need FIRST-TAKER-WINS across open counterparties.
+// We implement this with a LINEAR STATE CHANNEL:
+//
+//   auctionStateCh holds a single "open" token.
+//   Claiming requires consuming that token (for <- auctionStateCh).
+//   Exactly one bidder can consume it; the process calculus
+//   enforces mutual exclusion structurally — no mutex needed.
+//
+// PARTIES
+// -------
+//   seller  : holds the asset; acquires auctionContract to start
+//   bidder  : sends (bidderAddr, bidderKey, resultCh) to bidderPort
+//
+// FLOW
+//   1. Seller calls auctionContract to open the auction
+//   2. runAuction stepper manages descending price windows
+//   3. First bidder to claim consumes state token → wins
+//   4. Payment: bidder → seller; delivery: assetCap → assetDeliveryCh
+//   5. If price falls below reserve: auction expires, no sale
+//
+// AMOUNTS: all nanoREV (1 REV = 1e8 nanoREV)
+// TIME:    block numbers via rho:block:number
+// ============================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh
+in {
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ----------------------------------------------------------
+    // HELPER: REV transfer with error propagation
+    // ----------------------------------------------------------
+    new transfer in {
+      contract transfer(
+        @RevVault, @fromAddr, @toAddr, @amount, authKey, ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ----------------------------------------------------------
+      // CORE COMBINATORS (inlined for self-containment)
+      // ----------------------------------------------------------
+      new makeOne, makeGive, makeCand, makeGet, makeTruncate in {
+
+        contract makeOne(@amount, ret) = {
+          new ch in {
+            contract @(*ch)(
+              @holderAddr, _, @counterpartyAddr, counterpartyKey, res
+            ) = {
+              transfer!(
+                RevVault, counterpartyAddr, holderAddr,
+                amount, *counterpartyKey, *res
+              )
+            } |
+            ret!(*ch)
+          }
+        } |
+
+        contract makeGive(@inner, ret) = {
+          new ch in {
+            contract @(*ch)(hAddr, hKey, cAddr, cKey, res) = {
+              @inner!(*cAddr, *cKey, *hAddr, *hKey, *res)
+            } |
+            ret!(*ch)
+          }
+        } |
+
+        contract makeCand(@c1, @c2, ret) = {
+          new ch in {
+            contract @(*ch)(@hAddr, hKey, @cAddr, cKey, res) = {
+              new r1, r2 in {
+                @c1!(hAddr, *hKey, cAddr, *cKey, *r1) |
+                @c2!(hAddr, *hKey, cAddr, *cKey, *r2) |
+                for (@a <- r1; @b <- r2) {
+                  match (a, b) {
+                    ((true,_),(true,_)) => res!((true, Nil))
+                    ((false,e),_)       => res!((false, e))
+                    (_,(false,e))       => res!((false, e))
+                  }
+                }
+              }
+            } |
+            ret!(*ch)
+          }
+        } |
+
+        contract makeGet(@horizon, @inner, ret) = {
+          new ch in {
+            contract @(*ch)(@hAddr, hKey, @cAddr, cKey, res) = {
+              new blk in {
+                blockNumberCh!(*blk) |
+                for (@b <- blk) {
+                  if (b >= horizon) {
+                    @inner!(hAddr, *hKey, cAddr, *cKey, *res)
+                  } else {
+                    res!((false, "get: not yet at horizon"))
+                  }
+                }
+              }
+            } |
+            ret!(*ch)
+          }
+        } |
+
+        contract makeTruncate(@horizon, @inner, ret) = {
+          new ch in {
+            contract @(*ch)(@hAddr, hKey, @cAddr, cKey, res) = {
+              new blk in {
+                blockNumberCh!(*blk) |
+                for (@b <- blk) {
+                  if (b <= horizon) {
+                    @inner!(hAddr, *hKey, cAddr, *cKey, *res)
+                  } else {
+                    res!((true, Nil))   // past window → zero
+                  }
+                }
+              }
+            } |
+            ret!(*ch)
+          }
+        } |
+
+        // ----------------------------------------------------------
+        // makeDutchAuction
+        // ----------------------------------------------------------
+        // Parameters:
+        //   sellerAddr     : REV address receiving payment
+        //   startPrice     : opening ask in nanoREV
+        //   priceDecrement : nanoREV reduction per step
+        //   reservePrice   : floor; auction fails if reached without bid
+        //   startBlock     : block auction opens
+        //   stepInterval   : blocks per price window
+        //   assetCap       : unforgeable name being auctioned
+        //                    (winner receives on assetDeliveryCh)
+        // ----------------------------------------------------------
+        new makeDutchAuction in {
+          contract makeDutchAuction(
+            @sellerAddr,
+            @startPrice,
+            @priceDecrement,
+            @reservePrice,
+            @startBlock,
+            @stepInterval,
+            @assetCap,
+            ret
+          ) = {
+            // Linear state token — exactly one bidder can consume this
+            new auctionStateCh,
+                bidderPort,       // open channel: any bidder sends here
+                assetDeliveryCh,  // winner receives assetCap here
+                runAuction        // recursive price-step stepper
+            in {
+
+              // Seed the linear state token
+              auctionStateCh!("open") |
+
+              // ------------------------------------------------
+              // AUCTION STEPPER
+              // ------------------------------------------------
+              // Each call manages one price window [windowStart, wEnd).
+              // It installs a bid listener for the window, then either:
+              //   (a) a bid arrives and state token is consumed → settle
+              //   (b) window closes with no bid → drop price, recurse
+              //   (c) price < reservePrice → expire, auction fails
+              //
+              // SPJ equivalent for each step:
+              //   truncate(wEnd, get(windowStart,
+              //     give(one(currentPrice))     -- payment leg
+              //     `cand`
+              //     assetTransfer               -- delivery leg
+              //   ))
+              // ------------------------------------------------
+              contract runAuction(@currentPrice, @windowStart) = {
+                match currentPrice < reservePrice {
+
+                  // --- CASE: reserve not met → auction expires ---
+                  true => {
+                    stdout!("Dutch auction: reserve price not met. No sale.") |
+                    for (_ <- auctionStateCh) { Nil }   // drain token
+                  }
+
+                  // --- CASE: window is live ---
+                  false => {
+                    new wEndCh in {
+                      @wEndCh!(windowStart + stepInterval) |
+                      for (@wEnd <- wEndCh) {
+
+                        stdout!(["Price window:",
+                                 "price=", currentPrice,
+                                 "blocks=[", windowStart, ",", wEnd, ")"]) |
+
+                        // bidHandled: signals whether this window
+                        // produced a sale (true) or not (false)
+                        new bidHandled in {
+
+                          // --- BID LISTENER ---
+                          // Bidder sends: (bidderAddr, bidderKey, resultCh)
+                          // We check the block window, then compete for
+                          // the linear state token.
+                          for (@bidderAddr, bidderKey, bidResultCh <- bidderPort) {
+                            new blkCh in {
+                              blockNumberCh!(*blkCh) |
+                              for (@b <- blkCh) {
+                                match (b >= windowStart) && (b < wEnd) {
+
+                                  // --- In-window bid: race for state token ---
+                                  true => {
+                                    for (_ <- auctionStateCh) {
+                                      // State token consumed — this bidder wins
+
+                                      stdout!(["BID ACCEPTED",
+                                               "bidder=", bidderAddr,
+                                               "price=",  currentPrice,
+                                               "block=",  b]) |
+
+                                      // SPJ payment leg:
+                                      //   give(one(currentPrice)) acquired by seller
+                                      //   i.e. transfer currentPrice from bidder to seller
+                                      new payCh in {
+                                        transfer!(
+                                          RevVault,
+                                          bidderAddr,
+                                          sellerAddr,
+                                          currentPrice,
+                                          *bidderKey,
+                                          *payCh
+                                        ) |
+                                        for (@payResult <- payCh) {
+                                          match payResult {
+
+                                            // Payment succeeded → deliver asset
+                                            (true, _) => {
+                                              // SPJ delivery leg:
+                                              //   one(assetValue) acquired by bidder
+                                              assetDeliveryCh!(assetCap) |
+                                              bidResultCh!((true, {
+                                                "status" : "won",
+                                                "price"  : currentPrice,
+                                                "block"  : b
+                                              })) |
+                                              bidHandled!(true)
+                                            }
+
+                                            // Payment failed → release token, continue
+                                            (false, err) => {
+                                              stdout!(["Payment failed:", err,
+                                                       "— re-opening auction window"]) |
+                                              auctionStateCh!("open") |
+                                              bidResultCh!((false, {
+                                                "status" : "payment-failed",
+                                                "error"  : err
+                                              })) |
+                                              bidHandled!(false)
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+
+                                  // --- Out-of-window bid: reject ---
+                                  false => {
+                                    bidResultCh!((false, {
+                                      "status" : "wrong-window",
+                                      "block"  : b,
+                                      "window" : [windowStart, wEnd]
+                                    })) |
+                                    bidHandled!(false)
+                                  }
+                                }
+                              }
+                            }
+                          } |
+
+                          // --- WINDOW EXPIRY HANDLER ---
+                          // When bidHandled receives:
+                          //   true  → sale complete, stop
+                          //   false → no sale this window, drop price
+                          //
+                          // In production a watcher process fires this
+                          // at block wEnd. Here bidHandled is driven
+                          // by the bid listener above.
+                          for (@handled <- bidHandled) {
+                            match handled {
+                              true => {
+                                stdout!("Auction concluded successfully.")
+                              }
+                              false => {
+                                stdout!(["Window expired. New price:",
+                                         currentPrice - priceDecrement]) |
+                                runAuction!(
+                                  currentPrice - priceDecrement,
+                                  wEnd
+                                )
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              } |
+
+              // ------------------------------------------------
+              // AUCTION CONTRACT (seller's handle)
+              // ------------------------------------------------
+              // Seller acquires this to open the auction.
+              // It starts the runAuction stepper and immediately
+              // returns the bidderPort and assetDeliveryCh to the
+              // seller so they can share bidderPort publicly.
+              //
+              // SPJ signature:
+              //   auctionContract :: Contract
+              //   holder   = seller (receives proceeds)
+              //   counterparty = N/A at this level
+              //     (actual counterparties are the bidders, each
+              //      implicitly a one-shot counterparty to the step
+              //      contract they claim)
+              // ------------------------------------------------
+              new auctionContract in {
+                contract @(*auctionContract)(
+                  @sellerHolderAddr, _, _, _, sellerResultCh
+                ) = {
+                  runAuction!(startPrice, startBlock) |
+                  sellerResultCh!((true, {
+                    "status"          : "auction-started",
+                    "bidderPort"      : *bidderPort,
+                    "assetDeliveryCh" : *assetDeliveryCh
+                  }))
+                } |
+
+                // Build price schedule descriptor (informational)
+                new buildSchedule in {
+                  contract buildSchedule(@price, @block, @acc, schedRet) = {
+                    match price < reservePrice {
+                      true  => schedRet!(acc)
+                      false => {
+                        new na in {
+                          @na!(acc ++ [(block, price)]) |
+                          for (@naVal <- na) {
+                            buildSchedule!(
+                              price - priceDecrement,
+                              block + stepInterval,
+                              naVal,
+                              *schedRet
+                            )
+                          }
+                        }
+                      }
+                    }
+                  } |
+
+                  new scheduleCh in {
+                    buildSchedule!(startPrice, startBlock, [], *scheduleCh) |
+                    for (@schedule <- scheduleCh) {
+                      ret!({
+                        "type"           : "dutch-auction",
+                        "sellerAddr"     : sellerAddr,
+                        "startPrice"     : startPrice,
+                        "priceDecrement" : priceDecrement,
+                        "reservePrice"   : reservePrice,
+                        "startBlock"     : startBlock,
+                        "stepInterval"   : stepInterval,
+                        "priceSchedule"  : schedule,
+                        "auctionContract": *auctionContract,
+                        "bidderPort"     : *bidderPort,
+                        "assetDeliveryCh": *assetDeliveryCh
+                      })
+                    }
+                  }
+                }
+              }
+            }
+          } |
+
+          // ========================================================
+          // DEMO
+          // ========================================================
+          // Parameters:
+          //   startPrice    = 10000 nanoREV
+          //   priceDecrement = 1000 nanoREV per step
+          //   reservePrice  = 5000 nanoREV  (6 live steps)
+          //   startBlock    = 100
+          //   stepInterval  = 5 blocks
+          //
+          // Price schedule:
+          //   [100,105)  10000 nanoREV
+          //   [105,110)   9000
+          //   [110,115)   8000   ← bidder claims here
+          //   [115,120)   7000
+          //   [120,125)   6000
+          //   [125,130)   5000
+          //   block 130+: below reserve → no sale
+          //
+          // ========================================================
+          new auctionDescCh, assetCapability in {
+
+            assetCapability!("asset-token-001") |
+
+            stdout!("=== Building Dutch auction ===") |
+
+            makeDutchAuction!(
+              "11112RjfGFmNQCfpSqJGDHkCjRFnFucVGwDe9",
+              10000,
+              1000,
+              5000,
+              100,
+              5,
+              *assetCapability,
+              *auctionDescCh
+            ) |
+
+            for (@auction <- auctionDescCh) {
+              stdout!(["Auction descriptor:", auction]) |
+              stdout!(["Price schedule:", auction["priceSchedule"]]) |
+
+              // Show the SPJ combinator expansion
+              stdout!("") |
+              stdout!("=== SPJ combinator expansion ===") |
+              stdout!("auction =") |
+              stdout!("  ( truncate(105, get(100, give(one(10000)))) `cand` deliver )") |
+              stdout!("  `or`") |
+              stdout!("  ( truncate(110, get(105, give(one( 9000)))) `cand` deliver )") |
+              stdout!("  `or`") |
+              stdout!("  ( truncate(115, get(110, give(one( 8000)))) `cand` deliver )") |
+              stdout!("  `or`") |
+              stdout!("  ( truncate(120, get(115, give(one( 7000)))) `cand` deliver )") |
+              stdout!("  `or`") |
+              stdout!("  ( truncate(125, get(120, give(one( 6000)))) `cand` deliver )") |
+              stdout!("  `or`") |
+              stdout!("  ( truncate(130, get(125, give(one( 5000)))) `cand` deliver )") |
+              stdout!("  `or`") |
+              stdout!("  zero   -- reserve not met") |
+              stdout!("") |
+              stdout!("where deliver = one(assetCap) acquired by bidder") |
+              stdout!("and `or` is first-taker via linear auctionStateCh token") |
+              stdout!("") |
+              stdout!("To participate, a bidder sends to auction[bidderPort]:") |
+              stdout!("  (bidderAddr, bidderAuthKey, resultCh)") |
+              stdout!("  at any block in the desired price window") |
+              stdout!("  First successful claim wins; others receive wrong-window or are blocked")
+            }
+          }
+        }
+      }
+    }
+  }
+}
