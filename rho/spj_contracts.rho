@@ -1,0 +1,491 @@
+// ============================================================
+// SPJ Financial Contract Combinators in Rholang
+// Based on "Composing Contracts: An Adventure in Financial
+// Engineering" by Peyton Jones, Eber & Seward (ICFP 2000)
+//
+// Unit of value: REV (via RevVault / rho:rchain:revVault)
+// 1 REV = 1e8 nanoREV; all amounts here are in nanoREV.
+//
+// ARCHITECTURE
+// ------------
+// A Contract is represented as a channel C such that:
+//
+//   C!(holderVault, holderKey, counterpartyVault, ret)
+//
+// fires the contract's obligations. When acquired, it performs
+// any REV transfers due, then sends (true, Nil) on ret when
+// complete, or (false, errMsg) on failure.
+//
+// An Observable is a channel O such that:
+//
+//   O!(ret)
+//
+// sends the current Int value on ret. Observables are
+// time-varying quantities (price feeds, block heights, etc.)
+// supplied externally; their interface here is just a channel.
+//
+// A Horizon is an Int (block number). The system channel
+// `rho:block:number` provides the current block.
+//
+// COMBINATORS IMPLEMENTED
+// -----------------------
+//   zero           -- the null contract
+//   one(amount)    -- immediately pay `amount` nanoREV
+//   give(c)        -- reverse parties
+//   cand(c1, c2)   -- acquire both simultaneously
+//   cor(c1, c2)    -- holder chooses one (European-style)
+//   truncate(t, c) -- expire c at block t
+//   get(c)         -- acquire c at its horizon
+//   scaleK(x, c)   -- scale by constant x
+//   scale(obs, c)  -- scale by observable
+//   european(t, u) -- European option: choose at block t
+//   zcb(t, amount) -- zero-coupon bond: pay amount at block t
+//
+// DEMO at bottom: a zero-coupon bond and a European option.
+// ============================================================
+
+new
+  // System channels
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+
+  // Our combinator constructors
+  makeZero, makeOne, makeGive, makeCand, makeCor,
+  makeTruncate, makeGet, makeScaleK, makeScale,
+  makeEuropean, makeZcb,
+
+  // Demo output
+  stdout(`rho:io:stdout`),
+
+  // RevVault lookup
+  RevVaultCh
+
+in {
+
+  // -------------------------------------------------------
+  // Bootstrap: look up the RevVault system contract once.
+  // All combinator constructors receive RevVault as a param
+  // so they can issue transfers without re-looking it up.
+  // -------------------------------------------------------
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // =====================================================
+    // HELPER: transfer nanoREV from one vault to another.
+    // transfer(RevVault, fromAddr, toAddr, amount, authKey, ret)
+    // ret receives (true, Nil) or (false, errMsg)
+    // =====================================================
+    new transfer in {
+      contract transfer(
+        @RevVault,
+        @fromAddr, @toAddr,
+        @amount,
+        authKey,
+        ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) {
+            ret!((false, err))
+          }
+        }
+      } |
+
+      // ===================================================
+      // zero :: Contract
+      // The null contract. Acquired immediately, does nothing.
+      // ===================================================
+      contract makeZero(ret) = {
+        new zeroCh in {
+          contract @(*zeroCh)(holderVault, holderKey,
+                              counterpartyVault, res) = {
+            res!((true, Nil))
+          } |
+          ret!(*zeroCh)
+        }
+      } |
+
+      // ===================================================
+      // one :: Int -> Contract
+      // Pay `amount` nanoREV from counterparty to holder
+      // immediately upon acquisition.
+      // ===================================================
+      contract makeOne(@amount, ret) = {
+        new oneCh in {
+          contract @(*oneCh)(
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            // counterparty pays holder `amount` nanoREV
+            transfer!(
+              RevVault,
+              counterpartyAddr, holderAddr,
+              amount,
+              *counterpartyKey,
+              *res
+            )
+          } |
+          ret!(*oneCh)
+        }
+      } |
+
+      // ===================================================
+      // give :: Contract -> Contract
+      // Reverse holder and counterparty roles.
+      // ===================================================
+      contract makeGive(@innerC, ret) = {
+        new giveCh in {
+          contract @(*giveCh)(
+            holderAddr, holderKey,
+            counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            // swap: holder becomes counterparty and vice versa
+            @innerC!(*counterpartyAddr, *counterpartyKey,
+                     *holderAddr, *holderKey,
+                     *res)
+          } |
+          ret!(*giveCh)
+        }
+      } |
+
+      // ===================================================
+      // cand :: Contract -> Contract -> Contract
+      // Acquire both contracts simultaneously (parallel).
+      // Both must succeed for overall success.
+      // Corresponds to SPJ's `and`.
+      // ===================================================
+      contract makeCand(@c1, @c2, ret) = {
+        new candCh in {
+          contract @(*candCh)(
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            new res1, res2 in {
+              // Fire both contracts in parallel
+              @c1!(holderAddr, *holderKey,
+                   counterpartyAddr, *counterpartyKey,
+                   *res1) |
+              @c2!(holderAddr, *holderKey,
+                   counterpartyAddr, *counterpartyKey,
+                   *res2) |
+              // Wait for both to complete, join results
+              for (@r1 <- res1; @r2 <- res2) {
+                match (r1, r2) {
+                  ((true, _), (true, _)) => res!((true, Nil))
+                  ((false, e), _)        => res!((false, e))
+                  (_, (false, e))        => res!((false, e))
+                }
+              }
+            }
+          } |
+          ret!(*candCh)
+        }
+      } |
+
+      // ===================================================
+      // cor :: Contract -> Contract -> Contract
+      // Holder immediately chooses which contract to acquire.
+      // The chosen contract fires; the other is abandoned.
+      // Corresponds to SPJ's `or`.
+      //
+      // Usage: the holder sends their choice (1 or 2) on
+      // the choiceCh before acquiring corCh.
+      // In practice, the acquiring process sends the choice
+      // as part of the acquisition message.
+      // ===================================================
+      contract makeCor(@c1, @c2, ret) = {
+        new corCh in {
+          contract @(*corCh)(
+            @choice,                  // 1 or 2
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            match choice {
+              1 => @c1!(holderAddr, *holderKey,
+                         counterpartyAddr, *counterpartyKey,
+                         *res)
+              2 => @c2!(holderAddr, *holderKey,
+                         counterpartyAddr, *counterpartyKey,
+                         *res)
+              _ => res!((false, "cor: invalid choice"))
+            }
+          } |
+          ret!(*corCh)
+        }
+      } |
+
+      // ===================================================
+      // truncate :: Int -> Contract -> Contract
+      // The contract expires at block `horizon`.
+      // If current block > horizon, do nothing (like zero).
+      // ===================================================
+      contract makeTruncate(@horizon, @innerC, ret) = {
+        new truncCh in {
+          contract @(*truncCh)(
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            new blockCh in {
+              blockNumberCh!(*blockCh) |  // read current block
+              for (@currentBlock <- blockCh) {
+                if (currentBlock <= horizon) {
+                  @innerC!(holderAddr, *holderKey,
+                            counterpartyAddr, *counterpartyKey,
+                            *res)
+                } else {
+                  // expired: behaves like zero
+                  res!((true, Nil))
+                }
+              }
+            }
+          } |
+          ret!(*truncCh)
+        }
+      } |
+
+      // ===================================================
+      // get :: Contract -> Contract
+      // Acquire the inner contract at its horizon.
+      // Here horizon is passed explicitly since rholang
+      // contracts don't carry their own horizon as a value.
+      // get(horizon, c) waits until block = horizon, then
+      // acquires c.
+      //
+      // Implementation: busy-wait is not feasible on-chain.
+      // Instead, get creates a "deferred acquire" channel.
+      // A separate triggering process must call:
+      //   getTriggerCh!(holderAddr, holderKey,
+      //                 counterpartyAddr, counterpartyKey, res)
+      // at the correct block. The trigger channel IS the
+      // contract returned — the caller is responsible for
+      // invoking it at the right block.
+      //
+      // This is consistent with rholang's async model:
+      // the blockchain scheduler (or a watcher process)
+      // invokes the contract at the right time.
+      // ===================================================
+      contract makeGet(@horizon, @innerC, ret) = {
+        new getCh in {
+          contract @(*getCh)(
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            new blockCh in {
+              blockNumberCh!(*blockCh) |
+              for (@currentBlock <- blockCh) {
+                if (currentBlock >= horizon) {
+                  @innerC!(holderAddr, *holderKey,
+                            counterpartyAddr, *counterpartyKey,
+                            *res)
+                } else {
+                  res!((false, "get: horizon not yet reached"))
+                }
+              }
+            }
+          } |
+          ret!(*getCh)
+        }
+      } |
+
+      // ===================================================
+      // scaleK :: Int -> Contract -> Contract
+      // Scale all payments in c by integer factor x.
+      // Because RevVault transfers are in nanoREV (Int),
+      // scaling is done by wrapping `one` with multiplication.
+      //
+      // General scaleK works by reconstructing one(x * amount).
+      // For the composed case we take a simpler approach:
+      // scaleK wraps `one`-style contracts whose amount is
+      // known at construction time.
+      //
+      // For the general case (arbitrary inner contract),
+      // scaleK injects a multiplier observable and delegates
+      // to `scale` below.
+      // ===================================================
+      contract makeScaleK(@factor, @innerC, ret) = {
+        // Build a constant observable for `factor`
+        new constObsCh, scaledCh in {
+          // constObs is an observable that always returns factor
+          contract @(*constObsCh)(obsRet) = {
+            obsRet!(factor)
+          } |
+          makeScale!(*constObsCh, innerC, *scaledCh) |
+          for (@scaled <- scaledCh) {
+            ret!(scaled)
+          }
+        }
+      } |
+
+      // ===================================================
+      // scale :: Observable -> Contract -> Contract
+      // Scale payments in c by the value of observable obs
+      // at the moment of acquisition.
+      //
+      // Since general scaling of arbitrary contracts requires
+      // knowing the payment amounts inside them (which are
+      // opaque in our encoding), we implement scale specifically
+      // for `one`-style contracts: scale(obs, one(1)) creates
+      // a contract that pays obs() nanoREV.
+      //
+      // This is the clean path: `scale(obs, one(1))` is the
+      // primitive; scaleK(x, one(1)) = scale(konst(x), one(1)).
+      // ===================================================
+      contract makeScale(@obs, @innerC, ret) = {
+        new scaleCh in {
+          contract @(*scaleCh)(
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          ) = {
+            // Sample the observable at acquisition time
+            new obsCh in {
+              @obs!(*obsCh) |
+              for (@scaleFactor <- obsCh) {
+                // Inner contract fires; for `one`-style contracts,
+                // the scale factor is threaded through.
+                // We reconstruct a one(scaleFactor) to perform
+                // the scaled transfer directly.
+                new scaledOneCh, scaledOneRes in {
+                  makeOne!(scaleFactor, *scaledOneCh) |
+                  for (@scaledOne <- scaledOneCh) {
+                    @scaledOne!(holderAddr, *holderKey,
+                                counterpartyAddr, *counterpartyKey,
+                                *res)
+                  }
+                }
+              }
+            }
+          } |
+          ret!(*scaleCh)
+        }
+      } |
+
+      // ===================================================
+      // european :: Int -> Contract -> Contract
+      // European option: at block `t`, holder may choose to
+      // acquire underlying contract `u`, or do nothing.
+      //
+      // Defined as: get(t, truncate(t, u `cor` zero))
+      //
+      // The holder signals their choice (1=exercise, 2=lapse)
+      // when they invoke the returned contract at block t.
+      // ===================================================
+      contract makeEuropean(@t, @u, ret) = {
+        new zeroCh, corCh, truncCh, getCh in {
+          makeZero!(*zeroCh) |
+          for (@z <- zeroCh) {
+            makeCor!(u, z, *corCh) |
+            for (@corContract <- corCh) {
+              makeTruncate!(t, corContract, *truncCh) |
+              for (@truncContract <- truncCh) {
+                makeGet!(t, truncContract, *getCh) |
+                for (@getContract <- getCh) {
+                  ret!(getContract)
+                }
+              }
+            }
+          }
+        }
+      } |
+
+      // ===================================================
+      // zcb :: Int -> Int -> Contract
+      // Zero-coupon bond: pay `amount` nanoREV at block `t`.
+      // Defined as: get(t, truncate(t, one(amount)))
+      // ===================================================
+      contract makeZcb(@t, @amount, ret) = {
+        new oneCh, truncCh, getCh in {
+          makeOne!(amount, *oneCh) |
+          for (@oneContract <- oneCh) {
+            makeTruncate!(t, oneContract, *truncCh) |
+            for (@truncContract <- truncCh) {
+              makeGet!(t, truncContract, *getCh) |
+              for (@getContract <- getCh) {
+                ret!(getContract)
+              }
+            }
+          }
+        }
+      } |
+
+      // ==========================================================
+      // DEMO
+      // ==========================================================
+      // Demonstrates:
+      //   1. A zero-coupon bond: pay 500 nanoREV at block 100
+      //   2. A European option on that bond at block 90
+      //
+      // In a real deployment:
+      //   - holderAddr / counterpartyAddr are real REV addresses
+      //   - holderKey / counterpartyKey are auth keys from
+      //     RevVault!("deployerAuthKey", *deployerId, *keyCh)
+      //   - The contract is invoked by a watcher at the right block
+      // ==========================================================
+
+      new
+        deployerId(`rho:rchain:deployerId`),
+        holderKeyCh, counterpartyKeyCh,
+        zcbCh, europeanCh,
+        demoRet
+      in {
+
+        // Fetch the deployer's auth key (used as counterparty key
+        // in this demo — in production each party has their own)
+        @RevVault!("deployerAuthKey", *deployerId, *counterpartyKeyCh) |
+
+        for (counterpartyKey <- counterpartyKeyCh) {
+
+          stdout!("Building zero-coupon bond: 500 nanoREV at block 100") |
+
+          // Build zcb: pay 500 nanoREV at block 100
+          makeZcb!(100, 500, *zcbCh) |
+          for (@zcbContract <- zcbCh) {
+
+            stdout!("Building European option on zcb: exercisable at block 90") |
+
+            // Build European option: at block 90, choose to acquire
+            // the zcb or walk away
+            makeEuropean!(90, zcbContract, *europeanCh) |
+            for (@optionContract <- europeanCh) {
+
+              stdout!("Contracts built. In production, invoke at the right block:") |
+              stdout!("  optionContract!(choice, holderAddr, holderKey, counterpartyAddr, counterpartyKey, ret)") |
+              stdout!("  choice=1 to exercise (acquires zcb), choice=2 to lapse") |
+
+              // --- Inline exercise demo (choice=1, block check will
+              //     return false since we are not at block 90/100,
+              //     but demonstrates the call structure) ---
+              new demoHolderKey, demoRes in {
+                // In production: replace with real addresses and keys
+                optionContract!(
+                  1,                                    // exercise
+                  "11112abc...holderRevAddress",        // holderAddr
+                  *counterpartyKey,                     // holderKey (demo)
+                  "11112def...counterpartyRevAddress",  // counterpartyAddr
+                  *counterpartyKey,                     // counterpartyKey
+                  *demoRes
+                ) |
+                for (@result <- demoRes) {
+                  match result {
+                    (true, _)    => stdout!("Contract acquired successfully")
+                    (false, msg) => stdout!(["Contract result: ", msg])
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
