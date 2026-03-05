@@ -101,8 +101,9 @@ in {
       // ===================================================
       contract makeZero(ret) = {
         new zeroCh in {
-          contract @(*zeroCh)(holderVault, holderKey,
-                              counterpartyVault, res) = {
+          for (holderVault, holderKey,
+               counterpartyVault, res
+          <= zeroCh) {
             res!((true, Nil))
           } |
           ret!(*zeroCh)
@@ -116,11 +117,11 @@ in {
       // ===================================================
       contract makeOne(@amount, ret) = {
         new oneCh in {
-          contract @(*oneCh)(
+          for (
             @holderAddr, holderKey,
             @counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= oneCh) {
             // counterparty pays holder `amount` nanoREV
             transfer!(
               RevVault,
@@ -140,11 +141,11 @@ in {
       // ===================================================
       contract makeGive(@innerC, ret) = {
         new giveCh in {
-          contract @(*giveCh)(
+          for (
             holderAddr, holderKey,
             counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= giveCh) {
             // swap: holder becomes counterparty and vice versa
             @innerC!(*counterpartyAddr, *counterpartyKey,
                      *holderAddr, *holderKey,
@@ -162,11 +163,11 @@ in {
       // ===================================================
       contract makeCand(@c1, @c2, ret) = {
         new candCh in {
-          contract @(*candCh)(
+          for (
             @holderAddr, holderKey,
             @counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= candCh) {
             new res1, res2 in {
               // Fire both contracts in parallel
               @c1!(holderAddr, *holderKey,
@@ -202,12 +203,12 @@ in {
       // ===================================================
       contract makeCor(@c1, @c2, ret) = {
         new corCh in {
-          contract @(*corCh)(
+          for (
             @choice,                  // 1 or 2
             @holderAddr, holderKey,
             @counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= corCh) {
             match choice {
               1 => @c1!(holderAddr, *holderKey,
                          counterpartyAddr, *counterpartyKey,
@@ -229,11 +230,11 @@ in {
       // ===================================================
       contract makeTruncate(@horizon, @innerC, ret) = {
         new truncCh in {
-          contract @(*truncCh)(
+          for (
             @holderAddr, holderKey,
             @counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= truncCh) {
             new blockCh in {
               blockNumberCh!(*blockCh) |  // read current block
               for (@currentBlock <- blockCh) {
@@ -266,7 +267,7 @@ in {
       //   getTriggerCh!(holderAddr, holderKey,
       //                 counterpartyAddr, counterpartyKey, res)
       // at the correct block. The trigger channel IS the
-      // contract returned — the caller is responsible for
+      // contract returned \u2014 the caller is responsible for
       // invoking it at the right block.
       //
       // This is consistent with rholang's async model:
@@ -275,11 +276,11 @@ in {
       // ===================================================
       contract makeGet(@horizon, @innerC, ret) = {
         new getCh in {
-          contract @(*getCh)(
+          for (
             @holderAddr, holderKey,
             @counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= getCh) {
             new blockCh in {
               blockNumberCh!(*blockCh) |
               for (@currentBlock <- blockCh) {
@@ -316,7 +317,7 @@ in {
         // Build a constant observable for `factor`
         new constObsCh, scaledCh in {
           // constObs is an observable that always returns factor
-          contract @(*constObsCh)(obsRet) = {
+          for (obsRet <= constObsCh) {
             obsRet!(factor)
           } |
           makeScale!(*constObsCh, innerC, *scaledCh) |
@@ -342,11 +343,11 @@ in {
       // ===================================================
       contract makeScale(@obs, @innerC, ret) = {
         new scaleCh in {
-          contract @(*scaleCh)(
+          for (
             @holderAddr, holderKey,
             @counterpartyAddr, counterpartyKey,
             res
-          ) = {
+          <= scaleCh) {
             // Sample the observable at acquisition time
             new obsCh in {
               @obs!(*obsCh) |
@@ -440,7 +441,7 @@ in {
       in {
 
         // Fetch the deployer's auth key (used as counterparty key
-        // in this demo — in production each party has their own)
+        // in this demo \u2014 in production each party has their own)
         @RevVault!("deployerAuthKey", *deployerId, *counterpartyKeyCh) |
 
         for (counterpartyKey <- counterpartyKeyCh) {
