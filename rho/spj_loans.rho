@@ -1,0 +1,656 @@
+// ============================================================
+// Financial Instruments via SPJ Combinators in Rholang
+// ============================================================
+//
+// Instruments:
+//   1. shortTermLoan  -- high interest,  bullet repayment
+//   2. midTermLoan    -- moderate interest, coupon + principal
+//   3. longTermLoan   -- low interest, amortizing installments
+//   4. sellLoan       -- transfer lender position to new lender
+//
+// All amounts in nanoREV (1 REV = 1e8 nanoREV).
+// Interest is rational: rate = rateNum / rateDenom.
+//   e.g. 10% = (10, 100),  5% = (5, 100),  2% = (2, 100)
+//
+// LOAN STRUCTURE
+// --------------
+// A loan has two legs that run as independent contracts:
+//
+//   disbursement  :: Contract
+//     The lender pays the principal to the borrower once,
+//     at loan origination (block >= startBlock).
+//
+//   repayment     :: Contract
+//     The borrower pays back principal + interest to whoever
+//     currently holds the lender position.
+//     This leg is a capability channel: possessing it means
+//     you are entitled to receive repayments.
+//     It can be sold (see sellLoan).
+//
+// makeLoan returns both legs plus a lenderPositionCh:
+//   ret!((disbursementContract, repaymentContract, lenderPosCh))
+//
+// LOAN SALE
+// ---------
+// The lender position is an unforgeable channel (new name).
+// Selling the loan = exchanging a payment for that channel.
+// sellLoan builds:
+//   give(one(salePrice)) `and` transferLenderPos
+// where transferLenderPos sends lenderPosCh to the buyer.
+// ============================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh,
+
+  // Core combinators (imported from spj_contracts.rho logic,
+  // inlined here for self-containment)
+  makeZero, makeOne, makeGive, makeCand, makeCor,
+  makeTruncate, makeGet, makeScaleK,
+
+  // Loan constructors
+  makeScheduledPayments,
+  makeShortTermLoan,
+  makeMidTermLoan,
+  makeLongTermLoan,
+  makeSellLoan
+
+in {
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ----------------------------------------------------------
+    // HELPER: REV transfer
+    // ----------------------------------------------------------
+    new transfer in {
+      contract transfer(
+        @RevVault, @fromAddr, @toAddr, @amount, authKey, ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ----------------------------------------------------------
+      // CORE COMBINATORS (self-contained inline)
+      // ----------------------------------------------------------
+
+      contract makeZero(ret) = {
+        new ch in {
+          contract @(*ch)(_, _, _, _, res) = { res!((true, Nil)) } |
+          ret!(*ch)
+        }
+      } |
+
+      contract makeOne(@amount, ret) = {
+        new ch in {
+          contract @(*ch)(
+            @holderAddr, _, @counterpartyAddr, counterpartyKey, res
+          ) = {
+            transfer!(
+              RevVault, counterpartyAddr, holderAddr,
+              amount, *counterpartyKey, *res
+            )
+          } |
+          ret!(*ch)
+        }
+      } |
+
+      contract makeGive(@inner, ret) = {
+        new ch in {
+          contract @(*ch)(hAddr, hKey, cAddr, cKey, res) = {
+            @inner!(*cAddr, *cKey, *hAddr, *hKey, *res)
+          } |
+          ret!(*ch)
+        }
+      } |
+
+      contract makeCand(@c1, @c2, ret) = {
+        new ch in {
+          contract @(*ch)(
+            @hAddr, hKey, @cAddr, cKey, res
+          ) = {
+            new r1, r2 in {
+              @c1!(hAddr, *hKey, cAddr, *cKey, *r1) |
+              @c2!(hAddr, *hKey, cAddr, *cKey, *r2) |
+              for (@a <- r1; @b <- r2) {
+                match (a, b) {
+                  ((true,_),(true,_))  => res!((true, Nil))
+                  ((false,e),_)        => res!((false, e))
+                  (_,(false,e))        => res!((false, e))
+                }
+              }
+            }
+          } |
+          ret!(*ch)
+        }
+      } |
+
+      contract makeTruncate(@horizon, @inner, ret) = {
+        new ch in {
+          contract @(*ch)(
+            @hAddr, hKey, @cAddr, cKey, res
+          ) = {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b <= horizon) {
+                  @inner!(hAddr, *hKey, cAddr, *cKey, *res)
+                } else {
+                  res!((true, Nil))  // expired → zero
+                }
+              }
+            }
+          } |
+          ret!(*ch)
+        }
+      } |
+
+      contract makeGet(@horizon, @inner, ret) = {
+        new ch in {
+          contract @(*ch)(
+            @hAddr, hKey, @cAddr, cKey, res
+          ) = {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b >= horizon) {
+                  @inner!(hAddr, *hKey, cAddr, *cKey, *res)
+                } else {
+                  res!((false, "get: not yet at horizon"))
+                }
+              }
+            }
+          } |
+          ret!(*ch)
+        }
+      } |
+
+      // ----------------------------------------------------------
+      // HELPER: schedulePayment(horizon, amount) → Contract
+      // A single payment of `amount` nanoREV at block `horizon`.
+      // Defined as: get(horizon, truncate(horizon, one(amount)))
+      // ----------------------------------------------------------
+      new schedulePayment in {
+        contract schedulePayment(@horizon, @amount, ret) = {
+          new oneCh, truncCh, getCh in {
+            makeOne!(amount, *oneCh) |
+            for (@oneC <- oneCh) {
+              makeTruncate!(horizon, oneC, *truncCh) |
+              for (@truncC <- truncCh) {
+                makeGet!(horizon, truncC, *getCh) |
+                for (@getC <- getCh) { ret!(getC) }
+              }
+            }
+          }
+        } |
+
+        // ----------------------------------------------------------
+        // HELPER: makeScheduledPayments([(horizon, amount)], ret)
+        // Folds a list of scheduled payments into a cand-tree.
+        // All payments run as parallel obligations.
+        // ----------------------------------------------------------
+        contract makeScheduledPayments(@schedule, ret) = {
+          match schedule {
+            // Base case: single payment
+            [(horizon, amount)] => {
+              schedulePayment!(horizon, amount, *ret)
+            }
+            // Recursive case: first payment `cand` rest
+            [(horizon, amount) ...rest] => {
+              new firstCh, restCh, combinedCh in {
+                schedulePayment!(horizon, amount, *firstCh) |
+                makeScheduledPayments!(rest, *restCh) |
+                for (@first <- firstCh; @restC <- restCh) {
+                  makeCand!(first, restC, *combinedCh) |
+                  for (@combined <- combinedCh) { ret!(combined) }
+                }
+              }
+            }
+          }
+        } |
+
+        // ==========================================================
+        // INTEGER MATH HELPER: mulDiv(a, b, c, ret)
+        // Computes floor(a * b / c) in nanoREV integer arithmetic.
+        // Used for interest: interest = principal * rateNum / rateDenom
+        // ==========================================================
+        new mulDiv in {
+          contract mulDiv(@a, @b, @c, ret) = {
+            ret!((a * b) / c)
+          } |
+
+          // ==========================================================
+          // 1. SHORT-TERM LOAN
+          // ==========================================================
+          // High interest bullet loan.
+          // - Principal disbursed at startBlock
+          // - Single repayment (principal + interest) at startBlock + term
+          // - Typical params: term=10 blocks, rate=10%
+          //
+          // SPJ structure:
+          //   disbursement = get(start, truncate(start, give(one(principal))))
+          //   repayment    = get(start+term, truncate(start+term,
+          //                        one(principal + interest)))
+          // ==========================================================
+          contract makeShortTermLoan(
+            @principal,
+            @rateNum, @rateDenom,   // e.g. 10, 100 = 10%
+            @startBlock,
+            @term,                  // blocks until repayment
+            ret
+          ) = {
+            new interestCh, repayAmtCh,
+                disburseCh, repaymentCh in {
+
+              // interest = principal * rateNum / rateDenom
+              mulDiv!(principal, rateNum, rateDenom, *interestCh) |
+              for (@interest <- interestCh) {
+                new repayAmt in {
+                  @repayAmt!(principal + interest) |
+                  for (@totalRepay <- repayAmt) {
+
+                    // disbursement: lender → borrower at startBlock
+                    // give() because lender is the counterparty paying out
+                    new oneDisb, truncDisb, getDisb, giveDisb in {
+                      makeOne!(principal, *oneDisb) |
+                      for (@oneD <- oneDisb) {
+                        makeTruncate!(startBlock, oneD, *truncDisb) |
+                        for (@truncD <- truncDisb) {
+                          makeGet!(startBlock, truncD, *getDisb) |
+                          for (@getD <- getDisb) {
+                            makeGive!(getD, *giveDisb) |
+                            for (@disburse <- giveDisb) {
+                              disburseCh!(disburse)
+                            }
+                          }
+                        }
+                      }
+                    } |
+
+                    // repayment: borrower → lender at startBlock + term
+                    schedulePayment!(
+                      startBlock + term, totalRepay, *repaymentCh
+                    )
+                  }
+                }
+              } |
+
+              for (@disburse <- disburseCh; @repay <- repaymentCh) {
+                // Return both legs and a description
+                ret!({
+                  "type"        : "short-term-loan",
+                  "principal"   : principal,
+                  "rateNum"     : rateNum,
+                  "rateDenom"   : rateDenom,
+                  "startBlock"  : startBlock,
+                  "maturity"    : startBlock + term,
+                  "disbursement": disburse,
+                  "repayment"   : repay
+                })
+              }
+            }
+          } |
+
+          // ==========================================================
+          // 2. MID-TERM LOAN (Coupon Loan)
+          // ==========================================================
+          // Moderate interest, periodic coupon payments + bullet principal.
+          // - Principal disbursed at startBlock
+          // - `numCoupons` equal coupon payments, spaced `couponInterval`
+          //   blocks apart, each = principal * rateNum / rateDenom
+          //   (rate here is the per-coupon rate, not annual)
+          // - Principal returned at final coupon date
+          // - Typical params: numCoupons=5, interval=10, rate=5%
+          //
+          // SPJ structure:
+          //   repayment = cand(coupon@t1, cand(coupon@t2, ...
+          //                 cand(coupon@tN, one(principal)@tN)))
+          // ==========================================================
+          contract makeMidTermLoan(
+            @principal,
+            @rateNum, @rateDenom,
+            @startBlock,
+            @numCoupons,
+            @couponInterval,
+            ret
+          ) = {
+            new couponAmtCh in {
+              mulDiv!(principal, rateNum, rateDenom, *couponAmtCh) |
+              for (@couponAmt <- couponAmtCh) {
+
+                // Build schedule: [(t1, coupon), ..., (tN, coupon+principal)]
+                new buildSchedule in {
+                  contract buildSchedule(@i, @acc, schedRet) = {
+                    new tBlock in {
+                      @tBlock!(startBlock + (i * couponInterval)) |
+                      for (@t <- tBlock) {
+                        match i == numCoupons {
+                          true => {
+                            // Last coupon: add principal back
+                            schedRet!(acc ++ [(t, couponAmt + principal)])
+                          }
+                          false => {
+                            new nextAcc in {
+                              @nextAcc!(acc ++ [(t, couponAmt)]) |
+                              for (@na <- nextAcc) {
+                                buildSchedule!(i + 1, na, *schedRet)
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } |
+
+                  new scheduleCh, repaymentCh,
+                      oneDisb, truncDisb, getDisb, giveDisb,
+                      disburseCh in {
+
+                    buildSchedule!(1, [], *scheduleCh) |
+
+                    // disbursement leg
+                    makeOne!(principal, *oneDisb) |
+                    for (@schedule <- scheduleCh; @oneD <- oneDisb) {
+                      makeTruncate!(startBlock, oneD, *truncDisb) |
+                      for (@truncD <- truncDisb) {
+                        makeGet!(startBlock, truncD, *getDisb) |
+                        for (@getD <- getDisb) {
+                          makeGive!(getD, *giveDisb) |
+                          for (@disburse <- giveDisb) {
+                            disburseCh!(disburse) |
+                            // repayment schedule
+                            makeScheduledPayments!(schedule, *repaymentCh)
+                          }
+                        }
+                      }
+                    } |
+
+                    for (@disburse <- disburseCh; @repay <- repaymentCh) {
+                      ret!({
+                        "type"        : "mid-term-loan",
+                        "principal"   : principal,
+                        "couponAmt"   : couponAmt,
+                        "rateNum"     : rateNum,
+                        "rateDenom"   : rateDenom,
+                        "startBlock"  : startBlock,
+                        "numCoupons"  : numCoupons,
+                        "interval"    : couponInterval,
+                        "maturity"    : startBlock + (numCoupons * couponInterval),
+                        "disbursement": disburse,
+                        "repayment"   : repay
+                      })
+                    }
+                  }
+                }
+              }
+            }
+          } |
+
+          // ==========================================================
+          // 3. LONG-TERM LOAN (Amortizing)
+          // ==========================================================
+          // Low interest, equal installments covering both interest
+          // and principal reduction over the full term.
+          //
+          // For simplicity we use flat equal installments:
+          //   installment = (principal + totalInterest) / numPayments
+          // (True amortization requires per-period balance tracking
+          // which demands recursion over mutable state; this flat
+          // approximation preserves the SPJ combinator structure.)
+          //
+          // - `numPayments` payments spaced `paymentInterval` blocks apart
+          // - Typical params: numPayments=10, interval=20, rate=2%
+          //   total interest = principal * rateNum / rateDenom
+          //
+          // SPJ structure: same as mid-term but no final principal lump —
+          //   every installment carries an equal share of principal.
+          // ==========================================================
+          contract makeLongTermLoan(
+            @principal,
+            @rateNum, @rateDenom,
+            @startBlock,
+            @numPayments,
+            @paymentInterval,
+            ret
+          ) = {
+            new totalInterestCh, totalRepayAmt in {
+              mulDiv!(principal, rateNum, rateDenom, *totalInterestCh) |
+              for (@totalInterest <- totalInterestCh) {
+                new installmentCh in {
+                  @installmentCh!((principal + totalInterest) / numPayments) |
+                  for (@installment <- installmentCh) {
+
+                    new buildSchedule in {
+                      contract buildSchedule(@i, @acc, schedRet) = {
+                        new t in {
+                          @t!(startBlock + (i * paymentInterval)) |
+                          for (@tVal <- t) {
+                            match i == numPayments {
+                              true  => schedRet!(acc ++ [(tVal, installment)])
+                              false => {
+                                new na in {
+                                  @na!(acc ++ [(tVal, installment)]) |
+                                  for (@naVal <- na) {
+                                    buildSchedule!(i + 1, naVal, *schedRet)
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      } |
+
+                      new scheduleCh, repaymentCh,
+                          oneDisb, truncDisb, getDisb, giveDisb,
+                          disburseCh in {
+
+                        buildSchedule!(1, [], *scheduleCh) |
+                        makeOne!(principal, *oneDisb) |
+
+                        for (@schedule <- scheduleCh; @oneD <- oneDisb) {
+                          makeTruncate!(startBlock, oneD, *truncDisb) |
+                          for (@truncD <- truncDisb) {
+                            makeGet!(startBlock, truncD, *getDisb) |
+                            for (@getD <- getDisb) {
+                              makeGive!(getD, *giveDisb) |
+                              for (@disburse <- giveDisb) {
+                                disburseCh!(disburse) |
+                                makeScheduledPayments!(schedule, *repaymentCh)
+                              }
+                            }
+                          }
+                        } |
+
+                        for (@disburse <- disburseCh; @repay <- repaymentCh) {
+                          ret!({
+                            "type"        : "long-term-loan",
+                            "principal"   : principal,
+                            "installment" : installment,
+                            "rateNum"     : rateNum,
+                            "rateDenom"   : rateDenom,
+                            "startBlock"  : startBlock,
+                            "numPayments" : numPayments,
+                            "interval"    : paymentInterval,
+                            "maturity"    : startBlock + (numPayments * paymentInterval),
+                            "disbursement": disburse,
+                            "repayment"   : repay
+                          })
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } |
+
+          // ==========================================================
+          // 4. LOAN SALE CONTRACT
+          // ==========================================================
+          // Transfers the lender's position (the repayment contract)
+          // to a new lender in exchange for a sale price.
+          //
+          // The repayment contract is an unforgeable channel — possessing
+          // it means you are entitled to invoke it as the holder
+          // (receiving the borrower's payments). This is the lender's
+          // asset. Selling it is simply:
+          //
+          //   give(one(salePrice))       -- new lender pays old lender
+          //   `cand`
+          //   transferCapability         -- old lender sends the repayment
+          //                                 channel to new lender
+          //
+          // transferCapability is a contract that, when acquired,
+          // sends the repaymentContract channel name to the buyer
+          // on the provided delivery channel.
+          //
+          // After the sale:
+          //   - Old lender has received salePrice nanoREV
+          //   - New lender holds the repayment contract channel
+          //     and can invoke it as holder to collect repayments
+          //   - Borrower's obligations are unchanged (the repayment
+          //     contract itself is unchanged; only who invokes it changes)
+          //
+          // SPJ framing:
+          //   sellLoan is itself a Contract. The "underlying asset"
+          //   being sold is the repayment leg. The sale price is the
+          //   present value the market assigns to future cash flows.
+          // ==========================================================
+          contract makeSellLoan(
+            @repaymentContract,  // the repayment channel from makeLoan
+            @salePrice,          // nanoREV the new lender pays
+            @deliveryCh,         // channel on which buyer receives repaymentContract
+            ret
+          ) = {
+            // Leg 1: new lender pays old lender `salePrice`
+            // From the old lender's perspective: they are the holder
+            // receiving payment. give(one(salePrice)) means the
+            // counterparty (new lender) pays the holder (old lender).
+            new paymentLegCh, giveLegCh in {
+              makeOne!(salePrice, *paymentLegCh) |
+              for (@paymentLeg <- paymentLegCh) {
+
+                // Leg 2: transfer of the repayment capability
+                // This is a contract that, when acquired, sends the
+                // repaymentContract name to deliveryCh.
+                // It has no REV transfer — it is pure capability transfer.
+                new capTransferCh in {
+                  new capTransfer in {
+                    contract @(*capTransfer)(_, _, _, _, res) = {
+                      // Deliver the repayment channel to the buyer
+                      @deliveryCh!(repaymentContract) |
+                      res!((true, Nil))
+                    } |
+                    capTransferCh!(*capTransfer)
+                  } |
+
+                  for (@capXfer <- capTransferCh) {
+                    // Combine: payment AND capability transfer
+                    new saleCh in {
+                      makeCand!(paymentLeg, capXfer, *saleCh) |
+                      for (@saleContract <- saleCh) {
+                        ret!({
+                          "type"           : "loan-sale",
+                          "salePrice"      : salePrice,
+                          "saleContract"   : saleContract,
+                          "deliveryCh"     : deliveryCh
+                        })
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } |
+
+          // ==========================================================
+          // DEMO
+          // ==========================================================
+          // Build all three loan types and a sale of the short-term
+          // loan's repayment leg.
+          //
+          // Params (all in nanoREV, blocks as time unit):
+          //   Short:  principal=10000, rate=10%, term=10 blocks
+          //   Mid:    principal=10000, rate=5%/coupon, 5 coupons, 10 blk
+          //   Long:   principal=10000, rate=2% total, 10 payments, 20 blk
+          // ==========================================================
+          new
+            deployerId(`rho:rchain:deployerId`),
+            lenderKeyCh,
+            shortLoanCh, midLoanCh, longLoanCh, saleCh,
+            deliveryCh
+
+          in {
+            @RevVault!("deployerAuthKey", *deployerId, *lenderKeyCh) |
+
+            stdout!("=== Building short-term loan ===") |
+            makeShortTermLoan!(
+              10000,       // principal nanoREV
+              10, 100,     // 10% interest
+              100,         // start block
+              10,          // 10-block term → repay at block 110
+              *shortLoanCh
+            ) |
+
+            stdout!("=== Building mid-term coupon loan ===") |
+            makeMidTermLoan!(
+              10000,       // principal nanoREV
+              5, 100,      // 5% per coupon
+              100,         // start block
+              5,           // 5 coupon periods
+              10,          // every 10 blocks → matures block 150
+              *midLoanCh
+            ) |
+
+            stdout!("=== Building long-term amortizing loan ===") |
+            makeLongTermLoan!(
+              10000,       // principal nanoREV
+              2, 100,      // 2% total interest
+              100,         // start block
+              10,          // 10 installments
+              20,          // every 20 blocks → matures block 300
+              *longLoanCh
+            ) |
+
+            for (@shortLoan <- shortLoanCh) {
+              stdout!(["Short-term loan built:", shortLoan]) |
+
+              // Sell the short-term loan's repayment leg
+              // New lender pays 9800 nanoREV for the right to
+              // collect 11000 nanoREV at block 110 — a discount
+              // reflecting time value and credit risk.
+              stdout!("=== Building loan sale contract ===") |
+              makeSellLoan!(
+                shortLoan["repayment"],
+                9800,          // sale price (slight discount on PV)
+                *deliveryCh,   // buyer receives repayment channel here
+                *saleCh
+              ) |
+              for (@sale <- saleCh) {
+                stdout!(["Loan sale contract built:", sale]) |
+                stdout!("Old lender acquires saleContract to exchange repayment rights for 9800 nanoREV") |
+                stdout!("New lender receives repayment contract on deliveryCh and can invoke it at block 110")
+              }
+            } |
+
+            for (@midLoan <- midLoanCh) {
+              stdout!(["Mid-term loan built:", midLoan])
+            } |
+
+            for (@longLoan <- longLoanCh) {
+              stdout!(["Long-term loan built:", longLoan])
+            }
+          }
+        }
+      }
+    }
+  }
+}
