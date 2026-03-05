@@ -84,16 +84,16 @@ in {
 
       contract makeZero(ret) = {
         new ch in {
-          contract @(*ch)(_, _, _, _, res) = { res!((true, Nil)) } |
+          for (_, _, _, _, res <= ch) { res!((true, Nil)) } |
           ret!(*ch)
         }
       } |
 
       contract makeOne(@amount, ret) = {
         new ch in {
-          contract @(*ch)(
+          for (
             @holderAddr, _, @counterpartyAddr, counterpartyKey, res
-          ) = {
+          <= ch) {
             transfer!(
               RevVault, counterpartyAddr, holderAddr,
               amount, *counterpartyKey, *res
@@ -105,7 +105,7 @@ in {
 
       contract makeGive(@inner, ret) = {
         new ch in {
-          contract @(*ch)(hAddr, hKey, cAddr, cKey, res) = {
+          for (hAddr, hKey, cAddr, cKey, res <= ch) {
             @inner!(*cAddr, *cKey, *hAddr, *hKey, *res)
           } |
           ret!(*ch)
@@ -114,9 +114,9 @@ in {
 
       contract makeCand(@c1, @c2, ret) = {
         new ch in {
-          contract @(*ch)(
+          for (
             @hAddr, hKey, @cAddr, cKey, res
-          ) = {
+          <= ch) {
             new r1, r2 in {
               @c1!(hAddr, *hKey, cAddr, *cKey, *r1) |
               @c2!(hAddr, *hKey, cAddr, *cKey, *r2) |
@@ -135,9 +135,9 @@ in {
 
       contract makeTruncate(@horizon, @inner, ret) = {
         new ch in {
-          contract @(*ch)(
+          for (
             @hAddr, hKey, @cAddr, cKey, res
-          ) = {
+          <= ch) {
             new blk in {
               blockNumberCh!(*blk) |
               for (@b <- blk) {
@@ -155,9 +155,9 @@ in {
 
       contract makeGet(@horizon, @inner, ret) = {
         new ch in {
-          contract @(*ch)(
+          for (
             @hAddr, hKey, @cAddr, cKey, res
-          ) = {
+          <= ch) {
             new blk in {
               blockNumberCh!(*blk) |
               for (@b <- blk) {
@@ -544,7 +544,7 @@ in {
                 // It has no REV transfer — it is pure capability transfer.
                 new capTransferCh in {
                   new capTransfer in {
-                    contract @(*capTransfer)(_, _, _, _, res) = {
+                    for (_, _, _, _, res <= capTransfer) {
                       // Deliver the repayment channel to the buyer
                       @deliveryCh!(repaymentContract) |
                       res!((true, Nil))

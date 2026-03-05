@@ -76,9 +76,9 @@ in {
 
         contract makeOne(@amount, ret) = {
           new ch in {
-            contract @(*ch)(
+            for (
               @holderAddr, _, @counterpartyAddr, counterpartyKey, res
-            ) = {
+            <= ch) {
               transfer!(
                 RevVault, counterpartyAddr, holderAddr,
                 amount, *counterpartyKey, *res
@@ -90,7 +90,7 @@ in {
 
         contract makeGive(@inner, ret) = {
           new ch in {
-            contract @(*ch)(hAddr, hKey, cAddr, cKey, res) = {
+            for (hAddr, hKey, cAddr, cKey, res <= ch) {
               @inner!(*cAddr, *cKey, *hAddr, *hKey, *res)
             } |
             ret!(*ch)
@@ -99,7 +99,7 @@ in {
 
         contract makeCand(@c1, @c2, ret) = {
           new ch in {
-            contract @(*ch)(@hAddr, hKey, @cAddr, cKey, res) = {
+            for (@hAddr, hKey, @cAddr, cKey, res <= ch) {
               new r1, r2 in {
                 @c1!(hAddr, *hKey, cAddr, *cKey, *r1) |
                 @c2!(hAddr, *hKey, cAddr, *cKey, *r2) |
@@ -118,7 +118,7 @@ in {
 
         contract makeGet(@horizon, @inner, ret) = {
           new ch in {
-            contract @(*ch)(@hAddr, hKey, @cAddr, cKey, res) = {
+            for (@hAddr, hKey, @cAddr, cKey, res <= ch) {
               new blk in {
                 blockNumberCh!(*blk) |
                 for (@b <- blk) {
@@ -136,7 +136,7 @@ in {
 
         contract makeTruncate(@horizon, @inner, ret) = {
           new ch in {
-            contract @(*ch)(@hAddr, hKey, @cAddr, cKey, res) = {
+            for (@hAddr, hKey, @cAddr, cKey, res <= ch) {
               new blk in {
                 blockNumberCh!(*blk) |
                 for (@b <- blk) {
@@ -351,9 +351,9 @@ in {
               //      contract they claim)
               // ------------------------------------------------
               new auctionContract in {
-                contract @(*auctionContract)(
+                for (
                   @sellerHolderAddr, _, _, _, sellerResultCh
-                ) = {
+                <= auctionContract) {
                   runAuction!(startPrice, startBlock) |
                   sellerResultCh!((true, {
                     "status"          : "auction-started",
