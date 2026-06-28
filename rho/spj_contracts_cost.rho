@@ -1,0 +1,622 @@
+// ================================================================
+// SPJ Financial Contract Combinators in COST-ACCOUNTED Rholang
+// ================================================================
+// Re-expression of "Composing Contracts" (Peyton Jones, Eber &
+// Seward, ICFP 2000) under the cost-accounted rho calculus
+// (Meredith, "Cost-Accounted Rho Calculus", 2026) and the cost
+// endofunctor on ciGSLT (Meredith, "Continued Interactive GSLTs
+// and the Cost Endofunctor", 2026).
+//
+// WHAT IS NEW RELATIVE TO spj_contracts.rho
+// -----------------------------------------
+// 1. LOCATED FUEL SLOTS (the correction). In the rholang
+//    presentation of cost accounting, token stacks were written
+//    S ::= () | s : S and left to float in the parallel-
+//    composition bag. But | is associative-commutative, so a
+//    bare stack is reachable by *whatever is adjacent* -- i.e.
+//    by every process in the bag. That is ambient authority,
+//    the antithesis of an object-capability discipline. The fix,
+//    from the located-resource-stack analysis (ciGSLT s10.4;
+//    cost-accounted-rho s3.2, s5.7), is to LOCATE every stack at
+//    an interaction surface: an unforgeable channel created by
+//    `new`. Authority to draw fuel is then possession of the
+//    located channel, not adjacency. Here every funding slot is
+//    an unforgeable `new` name. A Slot carries exactly one
+//    message -- the current token stack as a list of signature
+//    denominations -- and is consumed/replaced atomically.
+//
+// 2. VALUABLE FRICTION. Every obligation that moves value is
+//    gated: it must `spend` a token from a located purse before
+//    it fires. There is no path to a transfer that escapes the
+//    cost layer.
+//
+// 3. ACCEPTANCE GATE / FINANCIAL ATOMICITY. A multi-step
+//    acquisition first RESERVES its whole token demand from the
+//    acquirer's slot, all-or-nothing (the linear resource proof
+//    of cost-accounted-rho s8.5-s8.8, realised at runtime). If
+//    the reservation fails, nothing fires and no value moves.
+//    If it succeeds, every step draws from the committed purse
+//    and cannot stall midway -- closing the partial-funding
+//    vulnerability latent in the original `cand`.
+//
+// 4. DEMAND TRACKING. Each combinator returns (channel, demand):
+//    `demand` is the number of funded rendezvous it will force,
+//    a conservative (worst-case-over-branches) bound for the
+//    data-dependent combinators (get/truncate/cor). This is the
+//    runtime reflection of the static demand function Delta_s.
+//
+// 5. COST != AMOUNT. Phlogiston demand counts gated rendezvous,
+//    NOT the REV magnitude moved. `scale` multiplies the REV
+//    paid but leaves the fuel demand at 1 (see makeScale).
+//
+// Unit of value: REV (rho:rchain:revVault); amounts in nanoREV.
+// Signatures here are modelled as opaque names (ground sigs in
+// G); compound signatures appear in the loan-sale file.
+// ================================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh,
+
+  // --- cost-accounting layer ---
+  mkSlot,        // create a located fuel slot
+  deposit,       // add tokens to a located slot
+  reserve,       // atomically reserve demand from one slot (acceptance gate)
+  reserve2,      // atomically reserve from two slots (compound / multi-sig)
+  spend,         // consume one token from a located purse
+  refund,        // return a purse's remainder to a slot (overcharge-and-refund)
+  acquire,       // fund-then-fire a contract from one party's slot
+  thiefDemo,     // demonstrates that located slots defeat ambient authority
+
+  // --- combinator constructors (each returns (ch, demand)) ---
+  makeZero, makeOne, makeGive, makeCand, makeCor,
+  makeTruncate, makeGet, makeScaleK, makeScale,
+  makeEuropean, makeZcb
+in {
+
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ============================================================
+    // COST-ACCOUNTING LAYER (located token stacks)
+    // ============================================================
+    // A located slot L holds one message: a list of signature
+    // denominations, e.g. ["alice","alice","alice"]. The list IS
+    // the token stack `s :: s :: s :: ()`. The list head is the
+    // "next token to spend" (the temporal monoid `::`); the
+    // located channel L is the spatial surface S(L, -). Only a
+    // holder of L can `for(... <- L)`, so authority is by
+    // matching surface, never by adjacency.
+
+    // mkSlot(initialStack, retL): seed a fresh located slot.
+    contract mkSlot(@initialStack, retL) = {
+      new L in {
+        L!(initialStack) |          // the located stack lives here
+        retL!(*L)
+      }
+    } |
+
+    // deposit(L, tokens): append tokens to the located slot.
+    // Located: the caller must already hold L.
+    contract deposit(@L, @tokens, ret) = {
+      for (@cur <- @L) {
+        @L!(cur ++ tokens) | ret!((true, Nil))
+      }
+    } |
+
+    // reserve(L, sig, n, ret): the ACCEPTANCE GATE.
+    // Atomically remove the first n tokens from L if they exist
+    // and all match `sig`, returning a fresh private purse P
+    // holding exactly those n tokens. Either the full reservation
+    // succeeds (true, P) or L is left UNTOUCHED (false, reason).
+    // This is the linear resource proof Sigma_s >= Delta_s: it is
+    // decided before any step of the funded transaction fires.
+    contract reserve(@L, @sig, @n, ret) = {
+      for (@stack <- @L) {
+        new takeCh, peel in {
+          // peel(rem, k, acc): remove k leading tokens, all == sig
+          contract peel(@rem, @k, @acc, pret) = {
+            match k {
+              0 => pret!((true, acc, rem))
+              _ => match rem {
+                [] => pret!((false, Nil, Nil))
+                [hd ...tl] => match hd == sig {
+                  true  => peel!(tl, k - 1, acc ++ [hd], *pret)
+                  false => pret!((false, Nil, Nil))
+                }
+              }
+            }
+          } |
+          peel!(stack, n, [], *takeCh) |
+          for (@result <- takeCh) {
+            match result {
+              (true, taken, remainder) => {
+                @L!(remainder) |                 // commit: remainder stays located at L
+                new P in {                       // committed purse, located at P
+                  P!(taken) |
+                  ret!((true, *P))
+                }
+              }
+              (false, _, _) => {
+                @L!(stack) |                     // REJECT: restore L untouched
+                ret!((false, "insufficient or mismatched fuel"))
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // reserve2: compound / multi-signature acceptance gate.
+    // Reserve n1 of sig1 from L1 AND n2 of sig2 from L2, atomically.
+    // If either leg cannot be funded, BOTH slots are left untouched
+    // and the whole transaction is rejected. This is Rule 2 of the
+    // cost calculus (compound signature, split tokens): the redex
+    // fires only if tokens from every component signature are
+    // present. Multi-sig is a consequence of the grammar.
+    contract reserve2(@L1, @sig1, @n1, @L2, @sig2, @n2, ret) = {
+      new r1 in {
+        reserve!(L1, sig1, n1, *r1) |
+        for (@res1 <- r1) {
+          match res1 {
+            (false, why) => ret!((false, ["leg1 unfunded:", why]))
+            (true, P1) => {
+              new r2 in {
+                reserve!(L2, sig2, n2, *r2) |
+                for (@res2 <- r2) {
+                  match res2 {
+                    (true, P2) => ret!((true, P1, P2))
+                    (false, why) => {
+                      // roll back leg1: return P1's tokens to L1,
+                      // leaving both slots as they were.
+                      refund!(L1, P1, Nil) |
+                      ret!((false, ["leg2 unfunded:", why]))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // spend(P, ret): consume one token from a committed purse.
+    // The purse is guaranteed non-empty by the acceptance gate, so
+    // this never strands a funded transaction.
+    contract spend(@P, ret) = {
+      for (@stack <- @P) {
+        match stack {
+          [] => { @P!([]) | ret!((false, "purse depleted")) }
+          [hd ...tl] => { @P!(tl) | ret!((true, hd)) }
+        }
+      }
+    } |
+
+    // refund(L, P, _): return whatever remains in purse P to slot L
+    // (the overcharge-and-refund discipline of s8.6: a conservative
+    // demand may over-reserve; the unforced remainder is returned).
+    contract refund(@L, @P, _) = {
+      for (@purseStack <- @P) {
+        for (@slotStack <- @L) {
+          @L!(slotStack ++ purseStack)
+        }
+      }
+    } |
+
+    // ============================================================
+    // THE BUG, MADE VISIBLE: located slots defeat ambient authority
+    // ============================================================
+    // With an UN-located stack (a bare message on a publicly known
+    // channel), any process that can name the channel drains it.
+    // With a LOCATED slot (an unforgeable `new` name), a process
+    // that was not handed the name cannot touch the fuel, even
+    // though parallel composition is AC and the thief sits in the
+    // same bag. The fuel is confined to holders of L by construction
+    // -- there is simply no thief code that can name L.
+    contract thiefDemo(_) = {
+      new locatedSlotCh in {
+        mkSlot!(["honest","honest"], *locatedSlotCh) |
+        for (@L <- locatedSlotCh) {
+          stdout!("[located] fuel sits on an unforgeable surface L;") |
+          stdout!("[located] no adjacent process can draw it without L.") |
+          new r in {
+            reserve!(L, "honest", 1, *r) |
+            for (@res <- r) {
+              match res {
+                (true, _)  => stdout!("[located] honest party drew 1 token: OK")
+                (false, m) => stdout!(["[located] unexpected:", m])
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // ============================================================
+    // REV TRANSFER HELPER (unchanged from the original)
+    // ============================================================
+    new transfer in {
+      contract transfer(
+        @RevVault, @fromAddr, @toAddr, @amount, authKey, ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ==========================================================
+      // FUNDED CONTRACT PROTOCOL
+      // ==========================================================
+      // A Contract is a channel C such that
+      //
+      //   C!(holderAddr, sHolder, counterpartyAddr, sCounterparty,
+      //      purse, res)
+      //
+      // fires the obligations, SPENDING from the located `purse`
+      // for each rendezvous, and sends (true, Nil) / (false, err)
+      // on res. `sHolder` / `sCounterparty` are signature
+      // denominations (names). `give` swaps both the addresses and
+      // the signatures. Constructors return (C, demand).
+      //
+      // `acquire` is the deployment boundary: it reserves `demand`
+      // from a party's slot (acceptance gate), fires C with the
+      // committed purse, then refunds any unforced remainder.
+      // ==========================================================
+
+      contract acquire(
+        @contract, @demand,
+        @holderAddr, @sHolder,
+        @counterpartyAddr, @sCounterparty,
+        @slot, @funderSig,
+        res
+      ) = {
+        new r in {
+          reserve!(slot, funderSig, demand, *r) |
+          for (@rr <- r) {
+            match rr {
+              (false, why) => res!((false, ["rejected at acceptance gate:", why]))
+              (true, purse) => {
+                new innerRes in {
+                  @contract!(holderAddr, sHolder,
+                             counterpartyAddr, sCounterparty,
+                             *purse, *innerRes) |
+                  for (@out <- innerRes) {
+                    refund!(slot, purse, Nil) |   // return unforced fuel
+                    res!(out)
+                  }
+                }
+              }
+            }
+          }
+        }
+      } |
+
+      // ==========================================================
+      // zero :: Contract           demand 0
+      // ==========================================================
+      contract makeZero(retPair) = {
+        new ch in {
+          for (_, _, _, _, _, res <= ch) { res!((true, Nil)) } |
+          retPair!((*ch, 0))
+        }
+      } |
+
+      // ==========================================================
+      // one :: Int -> Contract     demand 1
+      // Counterparty pays holder `amount` nanoREV. Spends 1 token.
+      // ==========================================================
+      contract makeOne(@amount, retPair) = {
+        new ch in {
+          for (
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            new s in {
+              spend!(purse, *s) |
+              for (@sres <- s) {
+                match sres {
+                  (false, m) => res!((false, ["one: unfunded:", m]))
+                  (true, _)  => {
+                    // counterparty authorises the payment; sCounterparty
+                    // both names the payer and keys the fuel just spent.
+                    transfer!(
+                      RevVault, counterpartyAddr, holderAddr,
+                      amount, sCounterparty, *res
+                    )
+                  }
+                }
+              }
+            }
+          } |
+          retPair!((*ch, 1))
+        }
+      } |
+
+      // ==========================================================
+      // give :: Contract -> Contract   demand unchanged
+      // Swap holder<->counterparty AND sHolder<->sCounterparty.
+      // ==========================================================
+      contract makeGive(@innerC, @innerDemand, retPair) = {
+        new ch in {
+          for (
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            @innerC!(counterpartyAddr, sCounterparty,
+                     holderAddr, sHolder,
+                     purse, *res)
+          } |
+          retPair!((*ch, innerDemand))
+        }
+      } |
+
+      // ==========================================================
+      // cand :: Contract -> Contract -> Contract
+      //   demand = d1 + d2
+      // SPJ `and`: acquire both, atomically. Because `acquire`
+      // reserved d1+d2 up front into `purse`, BOTH legs are funded
+      // before either fires. The partial-funding hazard of the
+      // original `cand` (one leg's transfer commits, the other
+      // stalls for fuel) is structurally impossible: this is the
+      // join-funding guarantee (cost-accounted-rho s4.8).
+      // ==========================================================
+      contract makeCand(@c1, @d1, @c2, @d2, retPair) = {
+        new ch in {
+          for (
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            new r1, r2 in {
+              @c1!(holderAddr, sHolder,
+                   counterpartyAddr, sCounterparty, purse, *r1) |
+              @c2!(holderAddr, sHolder,
+                   counterpartyAddr, sCounterparty, purse, *r2) |
+              for (@a <- r1; @b <- r2) {
+                match (a, b) {
+                  ((true,_),(true,_)) => res!((true, Nil))
+                  ((false,e),_)       => res!((false, e))
+                  (_,(false,e))       => res!((false, e))
+                }
+              }
+            }
+          } |
+          retPair!((*ch, d1 + d2))
+        }
+      } |
+
+      // ==========================================================
+      // cor :: Contract -> Contract -> Contract
+      //   demand = max(d1, d2)   (conservative; refund the rest)
+      // Holder chooses one leg. Only one fires, so the realised
+      // cost is the chosen branch; we reserve the worst case and
+      // refund the unforced remainder (data-dependent demand,
+      // cost-accounted-rho s8.6).
+      // ==========================================================
+      contract makeCor(@c1, @d1, @c2, @d2, retPair) = {
+        new ch in {
+          for (
+            @choice,
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            match choice {
+              1 => @c1!(holderAddr, sHolder,
+                        counterpartyAddr, sCounterparty, purse, *res)
+              2 => @c2!(holderAddr, sHolder,
+                        counterpartyAddr, sCounterparty, purse, *res)
+              _ => res!((false, "cor: invalid choice"))
+            }
+          } |
+          retPair!((*ch, if (d1 > d2) d1 else d2))
+        }
+      } |
+
+      // ==========================================================
+      // truncate :: Int -> Contract -> Contract
+      //   demand = innerDemand  (worst case: not yet expired)
+      // Reading the block height is itself a rendezvous, but it is
+      // free infrastructure (rho:block:number), not a signed leg,
+      // so it does not draw from the purse.
+      // ==========================================================
+      contract makeTruncate(@horizon, @innerC, @innerDemand, retPair) = {
+        new ch in {
+          for (
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b <= horizon) {
+                  @innerC!(holderAddr, sHolder,
+                           counterpartyAddr, sCounterparty, purse, *res)
+                } else {
+                  res!((true, Nil))   // expired -> behaves like zero
+                }
+              }
+            }
+          } |
+          retPair!((*ch, innerDemand))
+        }
+      } |
+
+      // ==========================================================
+      // get :: Int -> Contract -> Contract
+      //   demand = innerDemand
+      // Acquire inner at its horizon. The watcher/scheduler invokes
+      // this as its own funded deployment at the right block; under
+      // concurrent acceptance each such invocation is independently
+      // gated by its own linear resource proof.
+      // ==========================================================
+      contract makeGet(@horizon, @innerC, @innerDemand, retPair) = {
+        new ch in {
+          for (
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b >= horizon) {
+                  @innerC!(holderAddr, sHolder,
+                           counterpartyAddr, sCounterparty, purse, *res)
+                } else {
+                  res!((false, "get: horizon not yet reached"))
+                }
+              }
+            }
+          } |
+          retPair!((*ch, innerDemand))
+        }
+      } |
+
+      // ==========================================================
+      // scale :: Observable -> Contract -> Contract
+      //   demand = 1   (COST != AMOUNT)
+      // Scaling multiplies the REV paid by the sampled observable,
+      // but the number of funded rendezvous is unchanged: one
+      // transfer, one token. The fuel demand does NOT grow with the
+      // observable's magnitude. We implement the clean primitive
+      // scale(obs, one(1)) -> pays obs() nanoREV, spending 1 token.
+      // ==========================================================
+      contract makeScale(@obs, @innerC, @innerDemand, retPair) = {
+        new ch in {
+          for (
+            @holderAddr, @sHolder,
+            @counterpartyAddr, @sCounterparty,
+            @purse, res
+          <= ch) {
+            new obsCh in {
+              @obs!(*obsCh) |
+              for (@scaleFactor <- obsCh) {
+                new scaledPair in {
+                  makeOne!(scaleFactor, *scaledPair) |
+                  for (@(scaledOne, _) <- scaledPair) {
+                    @scaledOne!(holderAddr, sHolder,
+                                counterpartyAddr, sCounterparty,
+                                purse, *res)
+                  }
+                }
+              }
+            }
+          } |
+          retPair!((*ch, 1))
+        }
+      } |
+
+      // ==========================================================
+      // scaleK :: Int -> Contract -> Contract   demand 1
+      // scaleK x c = scale (konst x) c
+      // ==========================================================
+      contract makeScaleK(@factor, @innerC, @innerDemand, retPair) = {
+        new constObsCh, scaledPair in {
+          for (obsRet <= constObsCh) { obsRet!(factor) } |
+          makeScale!(*constObsCh, innerC, innerDemand, *scaledPair) |
+          for (@scaled <- scaledPair) { retPair!(scaled) }
+        }
+      } |
+
+      // ==========================================================
+      // european :: Int -> Contract -> Contract
+      // european t u = get(t, truncate(t, u `cor` zero))
+      // demand = max(demand(u), 0) = demand(u)  (conservative)
+      // ==========================================================
+      contract makeEuropean(@t, @u, @uDemand, retPair) = {
+        new zeroPair, corPair, truncPair, getPair in {
+          makeZero!(*zeroPair) |
+          for (@(z, dz) <- zeroPair) {
+            makeCor!(u, uDemand, z, dz, *corPair) |
+            for (@(corC, dCor) <- corPair) {
+              makeTruncate!(t, corC, dCor, *truncPair) |
+              for (@(truncC, dTr) <- truncPair) {
+                makeGet!(t, truncC, dTr, *getPair) |
+                for (@getC <- getPair) { retPair!(getC) }
+              }
+            }
+          }
+        }
+      } |
+
+      // ==========================================================
+      // zcb :: Int -> Int -> Contract
+      // zcb t amount = get(t, truncate(t, one(amount)))   demand 1
+      // ==========================================================
+      contract makeZcb(@t, @amount, retPair) = {
+        new onePair, truncPair, getPair in {
+          makeOne!(amount, *onePair) |
+          for (@(oneC, dOne) <- onePair) {
+            makeTruncate!(t, oneC, dOne, *truncPair) |
+            for (@(truncC, dTr) <- truncPair) {
+              makeGet!(t, truncC, dTr, *getPair) |
+              for (@getC <- getPair) { retPair!(getC) }
+            }
+          }
+        }
+      } |
+
+      // ==========================================================
+      // DEMO
+      // ==========================================================
+      new
+        deployerId(`rho:rchain:deployerId`),
+        zcbPair, europeanPair,
+        holderSlotCh
+      in {
+        stdout!("=== Cost-accounted SPJ combinators ===") |
+
+        // Located fuel slot for the acquiring party (the holder).
+        // Seed with 4 "holder" tokens. The acceptance gate reserves
+        // exactly the contract's demand from this slot.
+        mkSlot!(["holder","holder","holder","holder"], *holderSlotCh) |
+        for (@holderSlot <- holderSlotCh) {
+
+          thiefDemo!(Nil) |   // located-stack property
+
+          stdout!("Building zero-coupon bond: 500 nanoREV at block 100") |
+          makeZcb!(100, 500, *zcbPair) |
+          for (@(zcb, zcbDemand) <- zcbPair) {
+
+            stdout!(["zcb demand (funded rendezvous):", zcbDemand]) |
+            stdout!("Building European option on the zcb, exercisable at block 90") |
+
+            makeEuropean!(90, zcb, zcbDemand, *europeanPair) |
+            for (@(option, optDemand) <- europeanPair) {
+
+              stdout!(["european option demand:", optDemand]) |
+              stdout!("Acquiring the option (watcher fires `acquire` at block 90).") |
+
+              new demoRes in {
+                acquire!(
+                  option, optDemand,
+                  "11112abc...holderRevAddress", "holder",
+                  "11112def...counterpartyRevAddress", "counterparty",
+                  holderSlot, "holder",
+                  *demoRes
+                ) |
+                for (@result <- demoRes) {
+                  match result {
+                    (true, _)    => stdout!("Option acquired (funded, atomic).")
+                    (false, msg) => stdout!(["Option result:", msg])
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,420 @@
+// ================================================================
+// Dutch Auction via SPJ Combinators in COST-ACCOUNTED Rholang
+// ================================================================
+// Re-expression of spj_dutch_auction.rho under the cost-accounted
+// rho calculus, with the LOCATED-STACK correction.
+//
+// WHAT CHANGES
+// ------------
+// 1. FUNDING SLOTS FOR OPEN COUNTERPARTIES. Bidders are not known
+//    at compile time, so the linear-transfer sugar {..}_{s1 -o s2}
+//    (which names the funder statically) does not fit. The funding-
+//    slot pattern (cost-accounted-rho s5.7) does: each bidder
+//    presents their OWN located slot when bidding; the auction
+//    draws settlement fuel from that slot. The linear proof checks
+//    tokens PRESENT on the bidder's located slot, not who they are.
+//
+// 2. FIRST-TAKER FUSED WITH FUNDING. The original kept a bare
+//    "open" control token on auctionStateCh and, separately, ran a
+//    payment that could fail after the token was consumed -- a
+//    stranded-purse hazard. Here the located "open" token is the
+//    spatial surface S(L, -); winning the race AND passing the
+//    settlement acceptance gate are one atomic step. A winner who
+//    cannot fund settlement does NOT consume the open token, so the
+//    auction simply stays open. No half-settlement is possible.
+//
+// 3. CROSS-PARTY FUNDING (the -o split). Settlement is
+//    {payment}_bidder `cand` {delivery}_seller: the bidder funds
+//    the rendezvous that moves REV, the seller funds the rendezvous
+//    that delivers the asset. reserve2 gates BOTH atomically (Rule 2
+//    of the cost calculus). Neither party can impose cost on the
+//    other beyond what the split makes explicit.
+//
+// AMOUNTS: nanoREV. TIME: block numbers via rho:block:number.
+// ================================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh,
+
+  // cost-accounting layer
+  mkSlot, deposit, reserve, reserve2, spend, refund,
+
+  makeDutchAuction
+in {
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ============================================================
+    // COST-ACCOUNTING LAYER (located token stacks) -- condensed
+    // ============================================================
+    contract mkSlot(@initialStack, retL) = {
+      new L in { L!(initialStack) | retL!(*L) }
+    } |
+
+    contract deposit(@L, @tokens, ret) = {
+      for (@cur <- @L) { @L!(cur ++ tokens) | ret!((true, Nil)) }
+    } |
+
+    // Acceptance gate on one located slot: reserve n tokens of `sig`
+    // atomically, or leave the slot untouched.
+    contract reserve(@L, @sig, @n, ret) = {
+      for (@stack <- @L) {
+        new takeCh, peel in {
+          contract peel(@rem, @k, @acc, pret) = {
+            match k {
+              0 => pret!((true, acc, rem))
+              _ => match rem {
+                [] => pret!((false, Nil, Nil))
+                [hd ...tl] => match hd == sig {
+                  true  => peel!(tl, k - 1, acc ++ [hd], *pret)
+                  false => pret!((false, Nil, Nil))
+                }
+              }
+            }
+          } |
+          peel!(stack, n, [], *takeCh) |
+          for (@result <- takeCh) {
+            match result {
+              (true, taken, remainder) => {
+                @L!(remainder) |
+                new P in { P!(taken) | ret!((true, *P)) }
+              }
+              (false, _, _) => { @L!(stack) | ret!((false, "insufficient fuel")) }
+            }
+          }
+        }
+      }
+    } |
+
+    contract refund(@L, @P, _) = {
+      for (@purseStack <- @P) {
+        for (@slotStack <- @L) { @L!(slotStack ++ purseStack) }
+      }
+    } |
+
+    // Two-slot atomic reservation (compound / cross-party).
+    contract reserve2(@L1, @sig1, @n1, @L2, @sig2, @n2, ret) = {
+      new r1 in {
+        reserve!(L1, sig1, n1, *r1) |
+        for (@res1 <- r1) {
+          match res1 {
+            (false, why) => ret!((false, ["bidder unfunded:", why]))
+            (true, P1) => {
+              new r2 in {
+                reserve!(L2, sig2, n2, *r2) |
+                for (@res2 <- r2) {
+                  match res2 {
+                    (true, P2)   => ret!((true, P1, P2))
+                    (false, why) => {
+                      refund!(L1, P1, Nil) |    // roll back bidder leg
+                      ret!((false, ["seller unfunded:", why]))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    contract spend(@P, ret) = {
+      for (@stack <- @P) {
+        match stack {
+          []         => { @P!([]) | ret!((false, "purse depleted")) }
+          [hd ...tl] => { @P!(tl) | ret!((true, hd)) }
+        }
+      }
+    } |
+
+    // ============================================================
+    // REV TRANSFER HELPER
+    // ============================================================
+    new transfer in {
+      contract transfer(
+        @RevVault, @fromAddr, @toAddr, @amount, authKey, ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ----------------------------------------------------------
+      // makeDutchAuction
+      // ----------------------------------------------------------
+      // Parameters as before, plus sellerSlot: the seller's located
+      // fuel slot, which funds the asset-delivery leg of each
+      // settlement (the seller's side of the -o split).
+      // ----------------------------------------------------------
+      contract makeDutchAuction(
+        @sellerAddr, @sSeller,
+        @startPrice, @priceDecrement, @reservePrice,
+        @startBlock, @stepInterval,
+        @assetCap,
+        @sellerSlot,
+        ret
+      ) = {
+        new auctionStateCh,   // LOCATED "open" token (the surface S(L,-))
+            bidderPort,       // open channel: any bidder sends here
+            assetDeliveryCh,  // winner receives assetCap here
+            runAuction
+        in {
+
+          // Seed the located linear state token. Possession of
+          // auctionStateCh is the capability to settle; it is an
+          // unforgeable `new` name, so no adjacent process can race
+          // for it without having been handed the port.
+          auctionStateCh!("open") |
+
+          // ------------------------------------------------------
+          // AUCTION STEPPER
+          // ------------------------------------------------------
+          contract runAuction(@currentPrice, @windowStart) = {
+            match currentPrice < reservePrice {
+
+              // reserve not met -> auction expires
+              true => {
+                stdout!("Dutch auction: reserve not met. No sale.") |
+                for (_ <- auctionStateCh) { Nil }   // drain located token
+              }
+
+              // window live
+              false => {
+                new wEndCh in {
+                  @wEndCh!(windowStart + stepInterval) |
+                  for (@wEnd <- wEndCh) {
+
+                    stdout!(["Price window: price=", currentPrice,
+                             " blocks=[", windowStart, ",", wEnd, ")"]) |
+
+                    new bidHandled in {
+
+                      // --- BID LISTENER ---
+                      // Bidder sends (bidderAddr, sBidder, bidderSlot, resultCh).
+                      // bidderSlot is the bidder's OWN located funding
+                      // slot (the funding-slot pattern). The bidder
+                      // funds the payment rendezvous from it; the seller
+                      // funds the delivery rendezvous from sellerSlot.
+                      for (@bidderAddr, @sBidder, @bidderSlot, bidResultCh <- bidderPort) {
+                        new blkCh in {
+                          blockNumberCh!(*blkCh) |
+                          for (@b <- blkCh) {
+                            match (b >= windowStart) && (b < wEnd) {
+
+                              // in-window bid: race for the located token
+                              true => {
+                                for (_ <- auctionStateCh) {
+                                  // Won the race. ACCEPTANCE GATE for
+                                  // settlement: reserve 1 bidder-token
+                                  // (payment) AND 1 seller-token (delivery)
+                                  // atomically. If either is unfunded, we
+                                  // RESTORE the open token and the auction
+                                  // stays live -- no stranded purse.
+                                  new gate in {
+                                    reserve2!(bidderSlot, sBidder, 1,
+                                              sellerSlot, sSeller, 1, *gate) |
+                                    for (@g <- gate) {
+                                      match g {
+                                        (false, why) => {
+                                          auctionStateCh!("open") |   // re-open
+                                          bidResultCh!((false, {
+                                            "status": "settlement-unfunded",
+                                            "reason": why
+                                          })) |
+                                          bidHandled!(false)
+                                        }
+                                        (true, payPurse, delivPurse) => {
+                                          stdout!(["BID ACCEPTED bidder=", bidderAddr,
+                                                   " price=", currentPrice, " block=", b]) |
+
+                                          // payment leg (bidder funds): spend
+                                          // bidder token, then move REV.
+                                          new sp in {
+                                            spend!(payPurse, *sp) |
+                                            for (_ <- sp) {
+                                              new payCh in {
+                                                transfer!(
+                                                  RevVault, bidderAddr, sellerAddr,
+                                                  currentPrice, sBidder, *payCh
+                                                ) |
+                                                for (@payResult <- payCh) {
+                                                  match payResult {
+                                                    (true, _) => {
+                                                      // delivery leg (seller funds):
+                                                      // spend seller token, deliver asset.
+                                                      new sd in {
+                                                        spend!(delivPurse, *sd) |
+                                                        for (_ <- sd) {
+                                                          assetDeliveryCh!(assetCap) |
+                                                          bidResultCh!((true, {
+                                                            "status": "won",
+                                                            "price": currentPrice,
+                                                            "block": b
+                                                          })) |
+                                                          bidHandled!(true)
+                                                        }
+                                                      }
+                                                    }
+                                                    (false, err) => {
+                                                      // Payment failed AFTER the gate:
+                                                      // a RevVault-level failure (e.g.
+                                                      // insufficient REV), distinct from
+                                                      // unfunded phlogiston. Re-open and
+                                                      // return both reserved purses.
+                                                      auctionStateCh!("open") |
+                                                      refund!(bidderSlot, payPurse, Nil) |
+                                                      refund!(sellerSlot, delivPurse, Nil) |
+                                                      bidResultCh!((false, {
+                                                        "status": "payment-failed",
+                                                        "error": err
+                                                      })) |
+                                                      bidHandled!(false)
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+
+                              // out-of-window bid: reject (no fuel drawn)
+                              false => {
+                                bidResultCh!((false, {
+                                  "status": "wrong-window",
+                                  "block": b,
+                                  "window": [windowStart, wEnd]
+                                })) |
+                                bidHandled!(false)
+                              }
+                            }
+                          }
+                        }
+                      } |
+
+                      // WINDOW EXPIRY HANDLER
+                      for (@handled <- bidHandled) {
+                        match handled {
+                          true => stdout!("Auction concluded successfully.")
+                          false => {
+                            stdout!(["Window expired. New price:",
+                                     currentPrice - priceDecrement]) |
+                            runAuction!(currentPrice - priceDecrement, wEnd)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } |
+
+          // ------------------------------------------------------
+          // AUCTION CONTRACT (seller's handle)
+          // ------------------------------------------------------
+          new auctionContract in {
+            for (@sellerHolderAddr, _, _, _, _, sellerResultCh <= auctionContract) {
+              runAuction!(startPrice, startBlock) |
+              sellerResultCh!((true, {
+                "status": "auction-started",
+                "bidderPort": *bidderPort,
+                "assetDeliveryCh": *assetDeliveryCh
+              }))
+            } |
+
+            // informational price schedule
+            new buildSchedule in {
+              contract buildSchedule(@price, @block, @acc, schedRet) = {
+                match price < reservePrice {
+                  true  => schedRet!(acc)
+                  false => {
+                    new na in {
+                      @na!(acc ++ [(block, price)]) |
+                      for (@naVal <- na) {
+                        buildSchedule!(price - priceDecrement,
+                                       block + stepInterval, naVal, *schedRet)
+                      }
+                    }
+                  }
+                }
+              } |
+              new scheduleCh in {
+                buildSchedule!(startPrice, startBlock, [], *scheduleCh) |
+                for (@schedule <- scheduleCh) {
+                  ret!({
+                    "type": "dutch-auction",
+                    "sellerAddr": sellerAddr,
+                    "startPrice": startPrice,
+                    "priceDecrement": priceDecrement,
+                    "reservePrice": reservePrice,
+                    "startBlock": startBlock,
+                    "stepInterval": stepInterval,
+                    "priceSchedule": schedule,
+                    "auctionContract": *auctionContract,
+                    "bidderPort": *bidderPort,
+                    "assetDeliveryCh": *assetDeliveryCh
+                  })
+                }
+              }
+            }
+          }
+        }
+      } |
+
+      // ==========================================================
+      // DEMO
+      // ==========================================================
+      new auctionDescCh, assetCapability, sellerSlotCh in {
+
+        assetCapability!("asset-token-001") |
+        stdout!("=== Building cost-accounted Dutch auction ===") |
+
+        // Seller's located fuel slot funds the delivery leg of each
+        // settlement attempt. Six live windows -> at most six
+        // delivery attempts, so seed generously.
+        mkSlot!(["seller","seller","seller","seller","seller","seller"], *sellerSlotCh) |
+        for (@sellerSlot <- sellerSlotCh) {
+
+          makeDutchAuction!(
+            "11112RjfGFmNQCfpSqJGDHkCjRFnFucVGwDe9", "seller",
+            10000, 1000, 5000,
+            100, 5,
+            *assetCapability,
+            sellerSlot,
+            *auctionDescCh
+          ) |
+
+          for (@auction <- auctionDescCh) {
+            stdout!(["Price schedule:", auction.get("priceSchedule")]) |
+            stdout!("") |
+            stdout!("=== SPJ combinator expansion (cost-accounted) ===") |
+            stdout!("auction =") |
+            stdout!("  ( truncate(105, get(100, give(one(10000)))) `cand` deliver )") |
+            stdout!("  `or` ... `or` zero    -- first-taker via LOCATED open token") |
+            stdout!("") |
+            stdout!("each settlement = {payment}_bidder `cand` {delivery}_seller,") |
+            stdout!("gated atomically by reserve2(bidderSlot, sellerSlot).") |
+            stdout!("") |
+            stdout!("To bid, send to auction.bidderPort:") |
+            stdout!("  (bidderAddr, sBidder, bidderSlot, resultCh)") |
+            stdout!("  where bidderSlot is the bidder's own located fuel slot.") |
+            stdout!("First fully-funded in-window claim wins; an unfunded") |
+            stdout!("claim leaves the auction open (no stranded purse).")
+          }
+        }
+      }
+    }
+  }
+}

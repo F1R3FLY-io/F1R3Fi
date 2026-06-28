@@ -1,0 +1,594 @@
+// ================================================================
+// Financial Instruments via SPJ Combinators in COST-ACCOUNTED Rholang
+// ================================================================
+// Re-expression of spj_loans.rho under the cost-accounted rho
+// calculus, with the LOCATED-STACK correction.
+//
+// WHAT CHANGES
+// ------------
+// 1. CROSS-PARTY FUNDED LEGS. Disbursement is funded by the lender,
+//    repayment by the borrower (the -o split). Each leg is acquired
+//    as its OWN funded deployment at its own block: under concurrent
+//    acceptance (cost-accounted-rho s2.3) each scheduled payment is
+//    independently gated by a linear resource proof. A loan is not
+//    one run-to-completion deployment but a family of funded steps.
+//
+// 2. LOAN SALE AS A COMPOUND-SIGNATURE ATOMIC SWAP. The original
+//    sale was cand(give(one(salePrice)), capTransfer): two legs that
+//    could half-fire, leaving the buyer paying with no capability or
+//    receiving the capability for free. Here the sale is gated by
+//    reserve2(buyerSlot, sellerSlot) -- the compound authority
+//    s_buyer * s_seller (Rule 2 of the cost calculus). The swap
+//    fires only if BOTH parties' tokens are present; otherwise both
+//    slots are left untouched and no value or capability moves. The
+//    atomic-swap hazard is closed structurally.
+//
+// 3. LOCATED FUEL. Every party's fuel sits on an unforgeable `new`
+//    slot; a token is drawn only by a holder of the slot, never by
+//    adjacency in the AC bag.
+//
+// Interest is rational: rate = rateNum / rateDenom. Amounts nanoREV.
+// ================================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh,
+
+  // cost-accounting layer
+  mkSlot, reserve, reserve2, spend, refund, acquire,
+
+  // combinators (each returns (ch, demand))
+  makeOne, makeGive, makeCand, makeTruncate, makeGet,
+
+  // loan constructors
+  schedulePayment, makeScheduledPayments,
+  makeShortTermLoan, makeMidTermLoan, makeLongTermLoan, makeSellLoan
+in {
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ============================================================
+    // COST-ACCOUNTING LAYER (located token stacks) -- condensed
+    // ============================================================
+    contract mkSlot(@initialStack, retL) = {
+      new L in { L!(initialStack) | retL!(*L) }
+    } |
+
+    contract reserve(@L, @sig, @n, ret) = {
+      for (@stack <- @L) {
+        new takeCh, peel in {
+          contract peel(@rem, @k, @acc, pret) = {
+            match k {
+              0 => pret!((true, acc, rem))
+              _ => match rem {
+                [] => pret!((false, Nil, Nil))
+                [hd ...tl] => match hd == sig {
+                  true  => peel!(tl, k - 1, acc ++ [hd], *pret)
+                  false => pret!((false, Nil, Nil))
+                }
+              }
+            }
+          } |
+          peel!(stack, n, [], *takeCh) |
+          for (@result <- takeCh) {
+            match result {
+              (true, taken, remainder) => {
+                @L!(remainder) | new P in { P!(taken) | ret!((true, *P)) }
+              }
+              (false, _, _) => { @L!(stack) | ret!((false, "insufficient fuel")) }
+            }
+          }
+        }
+      }
+    } |
+
+    contract refund(@L, @P, _) = {
+      for (@purseStack <- @P) {
+        for (@slotStack <- @L) { @L!(slotStack ++ purseStack) }
+      }
+    } |
+
+    contract reserve2(@L1, @sig1, @n1, @L2, @sig2, @n2, ret) = {
+      new r1 in {
+        reserve!(L1, sig1, n1, *r1) |
+        for (@res1 <- r1) {
+          match res1 {
+            (false, why) => ret!((false, ["party1 unfunded:", why]))
+            (true, P1) => {
+              new r2 in {
+                reserve!(L2, sig2, n2, *r2) |
+                for (@res2 <- r2) {
+                  match res2 {
+                    (true, P2)   => ret!((true, P1, P2))
+                    (false, why) => {
+                      refund!(L1, P1, Nil) |
+                      ret!((false, ["party2 unfunded:", why]))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    contract spend(@P, ret) = {
+      for (@stack <- @P) {
+        match stack {
+          []         => { @P!([]) | ret!((false, "purse depleted")) }
+          [hd ...tl] => { @P!(tl) | ret!((true, hd)) }
+        }
+      }
+    } |
+
+    contract acquire(
+      @contract, @demand,
+      @holderAddr, @sHolder, @counterpartyAddr, @sCounterparty,
+      @slot, @funderSig, res
+    ) = {
+      new r in {
+        reserve!(slot, funderSig, demand, *r) |
+        for (@rr <- r) {
+          match rr {
+            (false, why) => res!((false, ["rejected at acceptance gate:", why]))
+            (true, purse) => {
+              new innerRes in {
+                @contract!(holderAddr, sHolder, counterpartyAddr, sCounterparty,
+                           *purse, *innerRes) |
+                for (@out <- innerRes) { refund!(slot, purse, Nil) | res!(out) }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // ============================================================
+    // REV TRANSFER HELPER
+    // ============================================================
+    new transfer in {
+      contract transfer(
+        @RevVault, @fromAddr, @toAddr, @amount, authKey, ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ----------------------------------------------------------
+      // CORE COMBINATORS (funded; each returns (ch, demand))
+      // ----------------------------------------------------------
+      contract makeOne(@amount, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new s in {
+              spend!(purse, *s) |
+              for (@sres <- s) {
+                match sres {
+                  (false, m) => res!((false, ["one: unfunded:", m]))
+                  (true, _)  => transfer!(RevVault, cAddr, hAddr, amount, sC, *res)
+                }
+              }
+            }
+          } |
+          retPair!((*ch, 1))
+        }
+      } |
+
+      contract makeGive(@inner, @innerDemand, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            @inner!(cAddr, sC, hAddr, sH, purse, *res)
+          } |
+          retPair!((*ch, innerDemand))
+        }
+      } |
+
+      contract makeCand(@c1, @d1, @c2, @d2, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new r1, r2 in {
+              @c1!(hAddr, sH, cAddr, sC, purse, *r1) |
+              @c2!(hAddr, sH, cAddr, sC, purse, *r2) |
+              for (@a <- r1; @b <- r2) {
+                match (a, b) {
+                  ((true,_),(true,_)) => res!((true, Nil))
+                  ((false,e),_)       => res!((false, e))
+                  (_,(false,e))       => res!((false, e))
+                }
+              }
+            }
+          } |
+          retPair!((*ch, d1 + d2))
+        }
+      } |
+
+      contract makeTruncate(@horizon, @inner, @innerDemand, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b <= horizon) {
+                  @inner!(hAddr, sH, cAddr, sC, purse, *res)
+                } else { res!((true, Nil)) }   // expired -> zero
+              }
+            }
+          } |
+          retPair!((*ch, innerDemand))
+        }
+      } |
+
+      contract makeGet(@horizon, @inner, @innerDemand, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b >= horizon) {
+                  @inner!(hAddr, sH, cAddr, sC, purse, *res)
+                } else { res!((false, "get: not yet at horizon")) }
+              }
+            }
+          } |
+          retPair!((*ch, innerDemand))
+        }
+      } |
+
+      // ----------------------------------------------------------
+      // schedulePayment(horizon, amount) -> (ch, demand=1)
+      // get(horizon, truncate(horizon, one(amount)))
+      // ----------------------------------------------------------
+      contract schedulePayment(@horizon, @amount, retPair) = {
+        new onePair, truncPair, getPair in {
+          makeOne!(amount, *onePair) |
+          for (@(oneC, dOne) <- onePair) {
+            makeTruncate!(horizon, oneC, dOne, *truncPair) |
+            for (@(truncC, dTr) <- truncPair) {
+              makeGet!(horizon, truncC, dTr, *getPair) |
+              for (@getC <- getPair) { retPair!(getC) }
+            }
+          }
+        }
+      } |
+
+      // makeScheduledPayments([(horizon, amount)]) -> (ch, demand=#payments)
+      contract makeScheduledPayments(@schedule, retPair) = {
+        match schedule {
+          [(horizon, amount)] => { schedulePayment!(horizon, amount, *retPair) }
+          [(horizon, amount) ...rest] => {
+            new firstPair, restPair in {
+              schedulePayment!(horizon, amount, *firstPair) |
+              makeScheduledPayments!(rest, *restPair) |
+              for (@(first, df) <- firstPair; @(restC, dr) <- restPair) {
+                makeCand!(first, df, restC, dr, *retPair)
+              }
+            }
+          }
+        }
+      } |
+
+      new mulDiv in {
+        contract mulDiv(@a, @b, @c, ret) = { ret!((a * b) / c) } |
+
+        // ========================================================
+        // 1. SHORT-TERM LOAN (bullet)
+        // disbursement = give(get(start, truncate(start, one(principal))))
+        //                funded by the LENDER
+        // repayment    = schedulePayment(start+term, principal+interest)
+        //                funded by the BORROWER
+        // ========================================================
+        contract makeShortTermLoan(
+          @principal, @rateNum, @rateDenom, @startBlock, @term, ret
+        ) = {
+          new interestCh in {
+            mulDiv!(principal, rateNum, rateDenom, *interestCh) |
+            for (@interest <- interestCh) {
+              new disbPair, repayPair in {
+
+                // disbursement leg
+                new onePair, truncPair, getPair in {
+                  makeOne!(principal, *onePair) |
+                  for (@(oneC, dOne) <- onePair) {
+                    makeTruncate!(startBlock, oneC, dOne, *truncPair) |
+                    for (@(truncC, dTr) <- truncPair) {
+                      makeGet!(startBlock, truncC, dTr, *getPair) |
+                      for (@(getC, dG) <- getPair) {
+                        makeGive!(getC, dG, *disbPair)
+                      }
+                    }
+                  }
+                } |
+
+                // repayment leg
+                schedulePayment!(startBlock + term, principal + interest, *repayPair) |
+
+                for (@(disb, disbDemand) <- disbPair; @(repay, repayDemand) <- repayPair) {
+                  ret!({
+                    "type": "short-term-loan",
+                    "principal": principal,
+                    "rateNum": rateNum, "rateDenom": rateDenom,
+                    "startBlock": startBlock,
+                    "maturity": startBlock + term,
+                    "disbursement": disb, "disbursementDemand": disbDemand,
+                    "repayment": repay, "repaymentDemand": repayDemand
+                  })
+                }
+              }
+            }
+          }
+        } |
+
+        // ========================================================
+        // 2. MID-TERM LOAN (coupon + bullet principal)
+        // ========================================================
+        contract makeMidTermLoan(
+          @principal, @rateNum, @rateDenom, @startBlock, @numCoupons, @couponInterval, ret
+        ) = {
+          new couponAmtCh in {
+            mulDiv!(principal, rateNum, rateDenom, *couponAmtCh) |
+            for (@couponAmt <- couponAmtCh) {
+              new buildSchedule in {
+                contract buildSchedule(@i, @acc, schedRet) = {
+                  new tBlock in {
+                    @tBlock!(startBlock + (i * couponInterval)) |
+                    for (@t <- tBlock) {
+                      match i == numCoupons {
+                        true  => schedRet!(acc ++ [(t, couponAmt + principal)])
+                        false => {
+                          new nextAcc in {
+                            @nextAcc!(acc ++ [(t, couponAmt)]) |
+                            for (@na <- nextAcc) { buildSchedule!(i + 1, na, *schedRet) }
+                          }
+                        }
+                      }
+                    }
+                  }
+                } |
+                new scheduleCh, disbPair, repayPair in {
+                  buildSchedule!(1, [], *scheduleCh) |
+
+                  // disbursement leg (lender-funded)
+                  new onePair, truncPair, getPair in {
+                    makeOne!(principal, *onePair) |
+                    for (@(oneC, dOne) <- onePair) {
+                      makeTruncate!(startBlock, oneC, dOne, *truncPair) |
+                      for (@(truncC, dTr) <- truncPair) {
+                        makeGet!(startBlock, truncC, dTr, *getPair) |
+                        for (@(getC, dG) <- getPair) { makeGive!(getC, dG, *disbPair) }
+                      }
+                    }
+                  } |
+
+                  for (@schedule <- scheduleCh) {
+                    makeScheduledPayments!(schedule, *repayPair) |
+                    for (@(disb, dDisb) <- disbPair; @(repay, dRepay) <- repayPair) {
+                      ret!({
+                        "type": "mid-term-loan",
+                        "principal": principal, "couponAmt": couponAmt,
+                        "rateNum": rateNum, "rateDenom": rateDenom,
+                        "startBlock": startBlock, "numCoupons": numCoupons,
+                        "interval": couponInterval,
+                        "maturity": startBlock + (numCoupons * couponInterval),
+                        "disbursement": disb, "disbursementDemand": dDisb,
+                        "repayment": repay, "repaymentDemand": dRepay
+                      })
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // ========================================================
+        // 3. LONG-TERM LOAN (flat amortizing)
+        // ========================================================
+        contract makeLongTermLoan(
+          @principal, @rateNum, @rateDenom, @startBlock, @numPayments, @paymentInterval, ret
+        ) = {
+          new totalInterestCh in {
+            mulDiv!(principal, rateNum, rateDenom, *totalInterestCh) |
+            for (@totalInterest <- totalInterestCh) {
+              new installmentCh in {
+                @installmentCh!((principal + totalInterest) / numPayments) |
+                for (@installment <- installmentCh) {
+                  new buildSchedule in {
+                    contract buildSchedule(@i, @acc, schedRet) = {
+                      new t in {
+                        @t!(startBlock + (i * paymentInterval)) |
+                        for (@tVal <- t) {
+                          match i == numPayments {
+                            true  => schedRet!(acc ++ [(tVal, installment)])
+                            false => {
+                              new na in {
+                                @na!(acc ++ [(tVal, installment)]) |
+                                for (@naVal <- na) { buildSchedule!(i + 1, naVal, *schedRet) }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    } |
+                    new scheduleCh, disbPair, repayPair in {
+                      buildSchedule!(1, [], *scheduleCh) |
+
+                      new onePair, truncPair, getPair in {
+                        makeOne!(principal, *onePair) |
+                        for (@(oneC, dOne) <- onePair) {
+                          makeTruncate!(startBlock, oneC, dOne, *truncPair) |
+                          for (@(truncC, dTr) <- truncPair) {
+                            makeGet!(startBlock, truncC, dTr, *getPair) |
+                            for (@(getC, dG) <- getPair) { makeGive!(getC, dG, *disbPair) }
+                          }
+                        }
+                      } |
+
+                      for (@schedule <- scheduleCh) {
+                        makeScheduledPayments!(schedule, *repayPair) |
+                        for (@(disb, dDisb) <- disbPair; @(repay, dRepay) <- repayPair) {
+                          ret!({
+                            "type": "long-term-loan",
+                            "principal": principal, "installment": installment,
+                            "rateNum": rateNum, "rateDenom": rateDenom,
+                            "startBlock": startBlock, "numPayments": numPayments,
+                            "interval": paymentInterval,
+                            "maturity": startBlock + (numPayments * paymentInterval),
+                            "disbursement": disb, "disbursementDemand": dDisb,
+                            "repayment": repay, "repaymentDemand": dRepay
+                          })
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // ========================================================
+        // 4. LOAN SALE -- COMPOUND-SIGNATURE ATOMIC SWAP
+        // ========================================================
+        // The lender position (the repayment channel) is sold for
+        // salePrice. The swap is:
+        //
+        //   {one(salePrice)}_buyer   `cand`   {capTransfer}_seller
+        //
+        // gated by reserve2(buyerSlot, sellerSlot): the compound
+        // authority s_buyer * s_seller. It fires only if BOTH parties
+        // are funded; otherwise both slots are restored and neither
+        // the REV nor the capability moves. No half-settled sale.
+        //
+        // makeSellLoan returns a `settle` contract; the caller invokes
+        // it with both parties' located slots.
+        // ========================================================
+        contract makeSellLoan(
+          @repaymentContract, @salePrice, @deliveryCh,
+          @sBuyer, @sSeller, ret
+        ) = {
+          new settle in {
+            // settle(buyerAddr, sellerAddr, buyerSlot, sellerSlot, res)
+            for (@buyerAddr, @sellerAddr, @buyerSlot, @sellerSlot, res <= settle) {
+              new gate in {
+                // ACCEPTANCE GATE for the whole swap (compound sig):
+                // 1 buyer token (payment) + 1 seller token (delivery).
+                reserve2!(buyerSlot, sBuyer, 1, sellerSlot, sSeller, 1, *gate) |
+                for (@g <- gate) {
+                  match g {
+                    (false, why) => res!((false, ["sale rejected (unfunded):", why]))
+                    (true, payPurse, delivPurse) => {
+                      // Sequence the swap: payment FIRST, capability
+                      // delivery ONLY on payment success. The acceptance
+                      // gate (reserve2) already guarantees BOTH legs are
+                      // funded; but the legs must not run concurrently,
+                      // because a RevVault-level payment failure (e.g.
+                      // insufficient REV) after delivery had already fired
+                      // would leak the lender position for free. Sequencing
+                      // closes that residual hazard -- the same settlement
+                      // order the auction uses. Fuel atomicity is from the
+                      // cost layer; REV-movement atomicity is from ordering.
+                      new sp in {
+                        spend!(payPurse, *sp) |
+                        for (_ <- sp) {
+                          new payRes in {
+                            transfer!(RevVault, buyerAddr, sellerAddr,
+                                      salePrice, sBuyer, *payRes) |
+                            for (@pr <- payRes) {
+                              match pr {
+                                (true, _) => {
+                                  // payment cleared: now deliver the capability
+                                  new sd in {
+                                    spend!(delivPurse, *sd) |
+                                    for (_ <- sd) {
+                                      @deliveryCh!(repaymentContract) |
+                                      res!((true, {
+                                        "status": "sold", "salePrice": salePrice
+                                      }))
+                                    }
+                                  }
+                                }
+                                (false, e) => {
+                                  // payment failed post-gate: nothing was
+                                  // delivered. The forced payment token is
+                                  // consumed (it paid for work done); the
+                                  // unspent delivery token is refunded.
+                                  refund!(buyerSlot, payPurse, Nil) |
+                                  refund!(sellerSlot, delivPurse, Nil) |
+                                  res!((false, ["payment failed:", e]))
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            ret!({
+              "type": "loan-sale",
+              "salePrice": salePrice,
+              "settle": *settle,
+              "deliveryCh": deliveryCh
+            })
+          }
+        } |
+
+        // ========================================================
+        // DEMO
+        // ========================================================
+        new
+          deployerId(`rho:rchain:deployerId`),
+          shortLoanCh, midLoanCh, longLoanCh, saleCh, deliveryCh
+        in {
+          stdout!("=== Building cost-accounted short-term loan ===") |
+          makeShortTermLoan!(10000, 10, 100, 100, 10, *shortLoanCh) |
+
+          stdout!("=== Building cost-accounted mid-term coupon loan ===") |
+          makeMidTermLoan!(10000, 5, 100, 100, 5, 10, *midLoanCh) |
+
+          stdout!("=== Building cost-accounted long-term amortizing loan ===") |
+          makeLongTermLoan!(10000, 2, 100, 100, 10, 20, *longLoanCh) |
+
+          for (@shortLoan <- shortLoanCh) {
+            stdout!(["Short-term loan built. repayment demand =",
+                     shortLoan.get("repaymentDemand")]) |
+
+            // Sell the short-term loan's repayment leg.
+            stdout!("=== Building loan-sale atomic swap ===") |
+            makeSellLoan!(
+              shortLoan.get("repayment"),
+              9800,            // sale price
+              *deliveryCh,
+              "buyer", "seller",
+              *saleCh
+            ) |
+            for (@sale <- saleCh) {
+              stdout!("Loan-sale swap built.") |
+              stdout!("Invoke sale.settle(buyerAddr, sellerAddr, buyerSlot, sellerSlot, res):") |
+              stdout!("  reserve2 gates payment+delivery atomically;") |
+              stdout!("  the sale completes in full or not at all.")
+            }
+          } |
+          for (@midLoan <- midLoanCh) {
+            stdout!(["Mid-term loan built. repayment demand =",
+                     midLoan.get("repaymentDemand")])
+          } |
+          for (@longLoan <- longLoanCh) {
+            stdout!(["Long-term loan built. repayment demand =",
+                     longLoan.get("repaymentDemand")])
+          }
+        }
+      }
+    }
+  }
+}
