@@ -1,0 +1,373 @@
+// ================================================================
+// spj-futures-cost.rho
+// Cash-settled futures in COST-ACCOUNTED Rholang
+// ================================================================
+// Re-expression of spj-futures.rho under the cost-accounted rho
+// calculus (Meredith, "Cost-Accounted Rho Calculus", 2026) and the
+// cost endofunctor on ciGSLT (Meredith, "Continued Interactive
+// GSLTs and the Cost Endofunctor", 2026), with the LOCATED-STACK
+// correction.
+//
+// WHY FUTURES IS DIFFERENT FROM THE LOAN / AUCTION CASES
+// ------------------------------------------------------
+// The SPJ futures is a BILATERAL settlement -- a contract for
+// differences in which BOTH parties owe each other at expiry T:
+//
+//   futures(T,F,spot) =
+//     get(T, truncate(T, cand( scale(spot, one(1)),   // cp -> holder: spot
+//                              give(one(F)) )))        // holder -> cp: F
+//
+// Read as two gross transfers: the counterparty pays the holder the
+// spot price, and the holder pays the counterparty the fixed price
+// F. This is the SHARPEST form of the partial-funding hazard
+// (cost-accounted-rho s8.2): if leg 1 fires (holder receives spot)
+// but leg 2 stalls (holder never pays F), the settlement is
+// one-sided. The two legs are funded by DIFFERENT parties, so this
+// is not the single-purse `cand` of the loan strips -- it is a
+// genuine two-sided obligation.
+//
+// THE COST-ACCOUNTED FORM: NET SETTLEMENT
+// ---------------------------------------
+// A futures is economically settled to the NET amount spot - F, in
+// one direction. Cost-accounting makes the gross two-leg form
+// strictly worse on BOTH axes the apparatus cares about:
+//
+//   * Atomicity. Two gross transfers can half-settle at the REV
+//     layer (one clears, the other bounces). A single net transfer
+//     is atomic BY CONSTRUCTION -- database-transaction atomicity is
+//     a theorem of the rewrite rules (cost-accounted-rho s8.1).
+//
+//   * Cost. Phlogiston counts funded rendezvous, not REV magnitude
+//     (the prism, cost-accounted-rho s5.6). Two gross transfers cost
+//     two tokens; the net transfer costs one, regardless of size.
+//
+// So the cost-accounted futures NETS: sample spot at T, compute
+// net = spot - F, and perform ONE transfer in the appropriate
+// direction. The settlement DIRECTION is data-dependent (sign of
+// net), so we reserve conservatively -- one token from EACH party's
+// located slot -- and refund the unused side after the run
+// (overcharge-and-refund, cost-accounted-rho s8.6). Realised cost is
+// one token; the other is returned untouched.
+//
+// LOCATED STACKS (the correction)
+// -------------------------------
+// Because | is associative-commutative, a bare token stack floats
+// free in the bag and any adjacent process can draw on it (ambient
+// authority, ciGSLT s10.2). Every fuel stack here lives on an
+// unforgeable `new` surface -- a located stack S(I, s::S') realised
+// as a token-stack message on channel I. Authority to spend is
+// possession of the surface, never adjacency (ciGSLT s10.4).
+//
+// BILATERAL ACQUISITION PROTOCOL
+// ------------------------------
+// Because direction is unknown until expiry, the futures contract
+// holds BOTH parties' purses:
+//
+//   futuresContract!(hAddr, sH, cAddr, sC,
+//                    holderPurse, cpPurse, res)
+//
+// `acquireFutures` is the bilateral deployment boundary: it reserves
+// one token from each party's located slot via reserve2 (Rule 2 of
+// the cost calculus: compound authority s_holder * s_counterparty),
+// fires the contract with both committed purses, then refunds both
+// remainders. Amounts in nanoREV.
+// ================================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh,
+
+  // cost-accounting layer
+  mkSlot, deposit, reserve, reserve2, spend, refund,
+
+  // futures
+  makeFutures, acquireFutures
+in {
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ============================================================
+    // COST-ACCOUNTING LAYER (located token stacks) -- condensed
+    // ============================================================
+    // A located slot L holds one message: a list of signature
+    // denominations (the token stack s :: s :: ... :: ()). L is an
+    // unforgeable `new` name, so only a holder of L can draw.
+
+    contract mkSlot(@initialStack, retL) = {
+      new L in { L!(initialStack) | retL!(*L) }
+    } |
+
+    contract deposit(@L, @tokens, ret) = {
+      for (@cur <- @L) { @L!(cur ++ tokens) | ret!((true, Nil)) }
+    } |
+
+    // Acceptance gate on one located slot: atomically remove n
+    // tokens of `sig`, or leave the slot untouched. This is the
+    // linear resource proof Sigma_s >= Delta_s decided BEFORE any
+    // funded step fires (cost-accounted-rho s8.5).
+    contract reserve(@L, @sig, @n, ret) = {
+      for (@stack <- @L) {
+        new takeCh, peel in {
+          contract peel(@rem, @k, @acc, pret) = {
+            match k {
+              0 => pret!((true, acc, rem))
+              _ => match rem {
+                [] => pret!((false, Nil, Nil))
+                [hd ...tl] => match hd == sig {
+                  true  => peel!(tl, k - 1, acc ++ [hd], *pret)
+                  false => pret!((false, Nil, Nil))
+                }
+              }
+            }
+          } |
+          peel!(stack, n, [], *takeCh) |
+          for (@result <- takeCh) {
+            match result {
+              (true, taken, remainder) => {
+                @L!(remainder) |
+                new P in { P!(taken) | ret!((true, *P)) }
+              }
+              (false, _, _) => { @L!(stack) | ret!((false, "insufficient fuel")) }
+            }
+          }
+        }
+      }
+    } |
+
+    contract refund(@L, @P, _) = {
+      for (@purseStack <- @P) {
+        for (@slotStack <- @L) { @L!(slotStack ++ purseStack) }
+      }
+    } |
+
+    // Two-slot atomic reservation: the compound / bilateral gate.
+    // Reserve from BOTH parties or neither (Rule 2). If the second
+    // leg cannot be funded, the first is rolled back.
+    contract reserve2(@L1, @sig1, @n1, @L2, @sig2, @n2, ret) = {
+      new r1 in {
+        reserve!(L1, sig1, n1, *r1) |
+        for (@res1 <- r1) {
+          match res1 {
+            (false, why) => ret!((false, ["leg1 unfunded:", why]))
+            (true, P1) => {
+              new r2 in {
+                reserve!(L2, sig2, n2, *r2) |
+                for (@res2 <- r2) {
+                  match res2 {
+                    (true, P2)   => ret!((true, P1, P2))
+                    (false, why) => {
+                      refund!(L1, P1, Nil) |
+                      ret!((false, ["leg2 unfunded:", why]))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    contract spend(@P, ret) = {
+      for (@stack <- @P) {
+        match stack {
+          []         => { @P!([]) | ret!((false, "purse depleted")) }
+          [hd ...tl] => { @P!(tl) | ret!((true, hd)) }
+        }
+      }
+    } |
+
+    // ============================================================
+    // REV TRANSFER HELPER
+    // ============================================================
+    // `sig` both funds the phlogiston of the move and is the
+    // RevVault auth key for it (signatures as names, s5.1).
+    new transfer in {
+      contract transfer(
+        @RevVault, @fromAddr, @toAddr, @amount, sig, ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *sig, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ==========================================================
+      // makeFutures :: Int -> Int -> Observable -> Contract
+      //
+      // NETTED cash settlement. The gross SPJ form it replaces is
+      //   get(T, truncate(T, cand(scale(spot,one(1)), give(one(F)))))
+      // which carries the bilateral half-settlement hazard above.
+      //
+      // Bilateral contract protocol (holds BOTH purses):
+      //   futuresContract!(hAddr, sH, cAddr, sC,
+      //                    holderPurse, cpPurse, res)
+      //
+      // Settlement at expiry T:
+      //   net = spot - F
+      //   net > 0  : counterparty pays holder net     (spend cpPurse)
+      //   net < 0  : holder pays counterparty (-net)   (spend holderPurse)
+      //   net = 0  : no transfer
+      // Exactly one transfer fires -> atomic by construction.
+      // ==========================================================
+      contract makeFutures(@T, @F, @spotObs, ret) = {
+        new futCh in {
+          for (
+            @hAddr, @sH, @cAddr, @sC,
+            @holderPurse, @cpPurse, res
+          <= futCh) {
+            new blk in {
+              blockNumberCh!(*blk) |        // free infrastructure read
+              for (@b <- blk) {
+                if (b < T) {
+                  // get(T, ...): cannot settle before expiry
+                  res!((false, "futures: expiry not yet reached"))
+                } else {
+                  if (b > T) {
+                    // truncate(T, ...): expired -> zero (no fuel drawn)
+                    res!((true, Nil))
+                  } else {
+                    // b == T: sample spot and net-settle
+                    new obsCh in {
+                      @spotObs!(*obsCh) |     // free feed read
+                      for (@spot <- obsCh) {
+                        new netCh in {
+                          @netCh!(spot - F) |
+                          for (@net <- netCh) {
+                            match net == 0 {
+                              true  => res!((true, Nil))       // flat: nothing moves
+                              false => match net > 0 {
+                                // spot > F: counterparty pays holder net
+                                true => {
+                                  new sp in {
+                                    spend!(cpPurse, *sp) |
+                                    for (@sres <- sp) {
+                                      match sres {
+                                        (false, m) => res!((false, ["futures: cp unfunded:", m]))
+                                        (true, _)  =>
+                                          transfer!(RevVault, cAddr, hAddr, net, sC, *res)
+                                      }
+                                    }
+                                  }
+                                }
+                                // spot < F: holder pays counterparty (-net)
+                                false => {
+                                  new sp in {
+                                    spend!(holderPurse, *sp) |
+                                    for (@sres <- sp) {
+                                      match sres {
+                                        (false, m) => res!((false, ["futures: holder unfunded:", m]))
+                                        (true, _)  =>
+                                          transfer!(RevVault, hAddr, cAddr, 0 - net, sH, *res)
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } |
+          ret!(*futCh)
+        }
+      } |
+
+      // ==========================================================
+      // acquireFutures: the BILATERAL deployment boundary.
+      // Conservatively reserves one token from EACH party's located
+      // slot (direction is unknown until expiry), fires the futures
+      // with both purses, then refunds both remainders. The paying
+      // side's purse ends empty; the other side's token is returned
+      // intact (overcharge-and-refund).
+      // ==========================================================
+      contract acquireFutures(
+        @futures,
+        @hAddr, @sH, @holderSlot,
+        @cAddr, @sC, @cpSlot,
+        res
+      ) = {
+        new gate in {
+          reserve2!(holderSlot, sH, 1, cpSlot, sC, 1, *gate) |
+          for (@g <- gate) {
+            match g {
+              (false, why) => res!((false, ["futures rejected at gate:", why]))
+              (true, holderPurse, cpPurse) => {
+                new innerRes in {
+                  @futures!(hAddr, sH, cAddr, sC,
+                            holderPurse, cpPurse, *innerRes) |
+                  for (@out <- innerRes) {
+                    refund!(holderSlot, holderPurse, Nil) |
+                    refund!(cpSlot, cpPurse, Nil) |
+                    res!(out)
+                  }
+                }
+              }
+            }
+          }
+        }
+      } |
+
+      // ==========================================================
+      // DEMO
+      // ==========================================================
+      // expiry T = 200, futures price F = 700, spot oracle = 750.
+      // Net = +50 -> counterparty pays holder 50 nanoREV in ONE
+      // transfer (one token from the counterparty's slot; the
+      // holder's reserved token is refunded).
+      // ==========================================================
+      new
+        deployerId(`rho:rchain:deployerId`),
+        sigCh, spotOracle, futuresCh,
+        holderSlotCh, cpSlotCh
+      in {
+        // Mock spot oracle: 750 nanoREV (free feed).
+        for (obsRet <= spotOracle) { obsRet!(750) } |
+
+        @RevVault!("deployerAuthKey", *deployerId, *sigCh) |
+        for (sig <- sigCh) {
+
+          stdout!("Building NETTED cash-settled future: expiry 200, F=700 nanoREV") |
+
+          // Both parties post located fuel slots.
+          mkSlot!(["holder"], *holderSlotCh) |
+          mkSlot!(["cp"], *cpSlotCh) |
+
+          makeFutures!(200, 700, *spotOracle, *futuresCh) |
+          for (@futures <- futuresCh;
+               @holderSlot <- holderSlotCh;
+               @cpSlot <- cpSlotCh) {
+
+            stdout!("Future built. At expiry, ONE net transfer settles it.") |
+            stdout!("acquireFutures reserves 1 token from each side, uses one, refunds the other.") |
+
+            new demoRes in {
+              acquireFutures!(
+                futures,
+                "11112abc...holderRevAddress", "holder", holderSlot,
+                "11112def...counterpartyRevAddress", "cp", cpSlot,
+                *demoRes
+              ) |
+              for (@result <- demoRes) {
+                match result {
+                  (true, _)    => stdout!("Future net-settled (atomic, single transfer).")
+                  (false, msg) => stdout!(["Future result:", msg])
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

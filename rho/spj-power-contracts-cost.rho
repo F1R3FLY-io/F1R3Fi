@@ -1,0 +1,901 @@
+// ================================================================
+// spj-power-contracts-cost.rho
+// Power-market financial instruments in COST-ACCOUNTED Rholang
+// ================================================================
+// Re-expression of spj-power-contracts.rho under the cost-accounted
+// rho calculus (Meredith, "Cost-Accounted Rho Calculus", 2026) and
+// the cost endofunctor on ciGSLT (Meredith, "Continued Interactive
+// GSLTs and the Cost Endofunctor", 2026), with the LOCATED-STACK
+// correction. Companion to spj-futures-cost.rho.
+//
+// ================================================================
+// FOUR COST-ACCOUNTING PATTERNS COVER ALL 14 INSTRUMENTS
+// ================================================================
+// Applying the apparatus to the power book exposes that the
+// original `cand` is OVERLOADED: it is used both for genuinely
+// simultaneous bilateral swaps and for bundles of independently-
+// scheduled obligations. Cost-accounting forces the distinction,
+// because the acceptance gate's scope IS the financial-atomicity
+// unit (cost-accounted-rho s8.8). The four patterns:
+//
+// (A) BILATERAL CASH SETTLEMENT (contracts for differences).
+//     Futures, VirtualPPA, SparkSpread, CRR, WeatherDerivative.
+//     The original models these as cand(receiveLeg, give(payLeg)) --
+//     two gross transfers in opposite directions, funded by
+//     different parties, the sharpest partial-funding hazard. We
+//     NET them: sample the net at settlement and do ONE transfer.
+//     A single transfer is atomic by construction (s8.1) and costs
+//     ONE token, not two (cost != amount, s5.6). Direction is
+//     data-dependent, so we reserve one token from EACH party's
+//     located slot and refund the unused side (overcharge-and-
+//     refund, s8.6). Realised by makeNetFuture + acquireBilateral.
+//
+// (B) SINGLE-FUNDER FIXED LEG. PPA period, RECForward, Capacity.
+//     A fixed payment in one direction. One funded transfer,
+//     demand 1, drawn from the payer's located slot. `give` swaps
+//     which party funds.
+//
+// (C) CONSERVATIVE-BOUND OPTIONS. Swing, FreqReg, Interruptible,
+//     and the option legs of DemandResponse / SpinningReserve.
+//     A `cor` / european choice is data-dependent: demand =
+//     max over branches, with the unforced branch refunded. The
+//     OPTION WRITER (the party that `give` puts on the paying side)
+//     must keep its slot funded for the worst case (exercise);
+//     the reservation is returned if the option lapses.
+//
+// (D) TIME-SEPARATED BUNDLES (concurrent acceptance). Strips (PPA,
+//     Swing, FreqReg, ForwardCurve) and premium+option pairs
+//     (DemandResponse, SpinningReserve). These are NOT one atomic
+//     gate: their legs fall at different blocks and (for the
+//     premium+option pairs) are funded by different parties. Under
+//     concurrent acceptance (s2.3) each leg is its OWN funded
+//     deployment, gated by its own linear resource proof. Fusing
+//     them into a single `cand` would over-reserve fuel and wrongly
+//     couple their atomicity. We therefore return such instruments
+//     as a LIST of independently-acquirable legs, each with its own
+//     demand, block, and funder -- the same shape the loan file
+//     used for disbursement vs. repayment.
+//
+// LOCATED STACKS (the correction). Because | is AC, a bare token
+// stack floats free and any adjacent process can draw it (ambient
+// authority, ciGSLT s10.2). Every fuel stack lives on an
+// unforgeable `new` surface S(I, s::S') (ciGSLT s10.4); authority
+// is possession of the surface, never adjacency.
+//
+// Amounts nanoREV. Time axis: block numbers. Observables are
+// persistent free feeds: for (ret <= obs) { ret!(value) }.
+// ================================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+  stdout(`rho:io:stdout`),
+  RevVaultCh,
+
+  // cost-accounting layer
+  mkSlot, deposit, reserve, reserve2, spend, refund, acquire,
+
+  // core combinators (each returns (ch, demand))
+  makeOne, makeGive, makeCor, makeTruncate, makeGet, makeScale,
+
+  // bilateral net settlement (pattern A)
+  makeNetFuture, acquireBilateral,
+
+  // power instruments
+  makePPA, makePowerFutures, makeSwing, makeInterruptible, makeCapacity,
+  makeRECForward, makeVirtualPPA, makeDemandResponse, makeFreqRegStrip,
+  makeSpinningReserve, makeForwardCurveStrip, makeSparkSpread,
+  makeWeatherDerivative, makeCRR
+in {
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // ============================================================
+    // COST-ACCOUNTING LAYER (located token stacks) -- condensed
+    // ============================================================
+    contract mkSlot(@initialStack, retL) = {
+      new L in { L!(initialStack) | retL!(*L) }
+    } |
+
+    contract deposit(@L, @tokens, ret) = {
+      for (@cur <- @L) { @L!(cur ++ tokens) | ret!((true, Nil)) }
+    } |
+
+    // Acceptance gate on one located slot (linear resource proof).
+    contract reserve(@L, @sig, @n, ret) = {
+      for (@stack <- @L) {
+        new takeCh, peel in {
+          contract peel(@rem, @k, @acc, pret) = {
+            match k {
+              0 => pret!((true, acc, rem))
+              _ => match rem {
+                [] => pret!((false, Nil, Nil))
+                [hd ...tl] => match hd == sig {
+                  true  => peel!(tl, k - 1, acc ++ [hd], *pret)
+                  false => pret!((false, Nil, Nil))
+                }
+              }
+            }
+          } |
+          peel!(stack, n, [], *takeCh) |
+          for (@result <- takeCh) {
+            match result {
+              (true, taken, remainder) => {
+                @L!(remainder) | new P in { P!(taken) | ret!((true, *P)) }
+              }
+              (false, _, _) => { @L!(stack) | ret!((false, "insufficient fuel")) }
+            }
+          }
+        }
+      }
+    } |
+
+    contract refund(@L, @P, _) = {
+      for (@purseStack <- @P) {
+        for (@slotStack <- @L) { @L!(slotStack ++ purseStack) }
+      }
+    } |
+
+    // Two-slot atomic reservation (compound / bilateral, Rule 2).
+    contract reserve2(@L1, @sig1, @n1, @L2, @sig2, @n2, ret) = {
+      new r1 in {
+        reserve!(L1, sig1, n1, *r1) |
+        for (@res1 <- r1) {
+          match res1 {
+            (false, why) => ret!((false, ["leg1 unfunded:", why]))
+            (true, P1) => {
+              new r2 in {
+                reserve!(L2, sig2, n2, *r2) |
+                for (@res2 <- r2) {
+                  match res2 {
+                    (true, P2)   => ret!((true, P1, P2))
+                    (false, why) => { refund!(L1, P1, Nil) | ret!((false, ["leg2 unfunded:", why])) }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    contract spend(@P, ret) = {
+      for (@stack <- @P) {
+        match stack {
+          []         => { @P!([]) | ret!((false, "purse depleted")) }
+          [hd ...tl] => { @P!(tl) | ret!((true, hd)) }
+        }
+      }
+    } |
+
+    // Single-funder deployment boundary: reserve `demand` from one
+    // party's slot, fire the contract with the committed purse,
+    // refund the unforced remainder (patterns B, C, D-strip).
+    contract acquire(
+      @contract, @demand,
+      @holderAddr, @sHolder, @counterpartyAddr, @sCounterparty,
+      @slot, @funderSig, res
+    ) = {
+      new r in {
+        reserve!(slot, funderSig, demand, *r) |
+        for (@rr <- r) {
+          match rr {
+            (false, why) => res!((false, ["rejected at gate:", why]))
+            (true, purse) => {
+              new innerRes in {
+                @contract!(holderAddr, sHolder, counterpartyAddr, sCounterparty,
+                           *purse, *innerRes) |
+                for (@out <- innerRes) { refund!(slot, purse, Nil) | res!(out) }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // ============================================================
+    // REV TRANSFER HELPER  (sig funds phlogiston AND authorises move)
+    // ============================================================
+    new transfer in {
+      contract transfer(@RevVault, @fromAddr, @toAddr, @amount, sig, ret) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *sig, *ret)
+          } |
+          for (@(false, err) <- vaultCh) { ret!((false, err)) }
+        }
+      } |
+
+      // ==========================================================
+      // CORE COMBINATORS (single-purse, demand-tracked)
+      // ==========================================================
+      // Contract protocol: C!(hAddr, sH, cAddr, sC, purse, res)
+      // `one` spends one token from `purse`; `give` swaps parties
+      // (hence which signature funds). Constructors return (ch, demand).
+
+      contract makeOne(@amount, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new s in {
+              spend!(purse, *s) |
+              for (@sres <- s) {
+                match sres {
+                  (false, m) => res!((false, ["one: unfunded:", m]))
+                  (true, _)  => transfer!(RevVault, cAddr, hAddr, amount, sC, *res)
+                }
+              }
+            }
+          } |
+          retPair!((*ch, 1))
+        }
+      } |
+
+      contract makeGive(@inner, @d, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            @inner!(cAddr, sC, hAddr, sH, purse, *res)
+          } |
+          retPair!((*ch, d))
+        }
+      } |
+
+      // Holder chooses; conservative demand = max(d1,d2), the
+      // unforced branch refunded by the deployment boundary.
+      contract makeCor(@c1, @d1, @c2, @d2, retPair) = {
+        new ch in {
+          for (@choice, @hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            match choice {
+              1 => @c1!(hAddr, sH, cAddr, sC, purse, *res)
+              2 => @c2!(hAddr, sH, cAddr, sC, purse, *res)
+              _ => res!((false, "cor: invalid choice"))
+            }
+          } |
+          retPair!((*ch, if (d1 > d2) d1 else d2))
+        }
+      } |
+
+      contract makeTruncate(@horizon, @inner, @d, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b <= horizon) { @inner!(hAddr, sH, cAddr, sC, purse, *res) }
+                else { res!((true, Nil)) }   // expired -> zero
+              }
+            }
+          } |
+          retPair!((*ch, d))
+        }
+      } |
+
+      contract makeGet(@horizon, @inner, @d, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b >= horizon) { @inner!(hAddr, sH, cAddr, sC, purse, *res) }
+                else { res!((false, "get: horizon not yet reached")) }
+              }
+            }
+          } |
+          retPair!((*ch, d))
+        }
+      } |
+
+      // Scale by an observable. Demand stays 1: phlogiston counts
+      // funded rendezvous, NOT REV magnitude (cost != amount).
+      contract makeScale(@obs, @inner, @d, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @purse, res <= ch) {
+            new obsCh in {
+              @obs!(*obsCh) |
+              for (@k <- obsCh) {
+                new onePair in {
+                  makeOne!(k, *onePair) |
+                  for (@(oneC, _) <- onePair) {
+                    @oneC!(hAddr, sH, cAddr, sC, purse, *res)
+                  }
+                }
+              }
+            }
+          } |
+          retPair!((*ch, 1))
+        }
+      } |
+
+      // ==========================================================
+      // PATTERN A: BILATERAL NET SETTLEMENT
+      // ==========================================================
+      // makeNetFuture(T, netObs) settles a contract for differences
+      // by ONE transfer of the signed net (holder-positive) sampled
+      // at T. netObs returns net = (what holder receives) - (what
+      // holder pays). net>0: cp pays holder; net<0: holder pays cp;
+      // net=0: nothing. Holds BOTH purses; one transfer fires.
+      //   futures/vPPA:  net = spot - strike
+      //   sparkSpread:   net = power - heatRate*gas
+      //   CRR/weather:   net >= 0 (one-directional), still one transfer
+      contract makeNetFuture(@T, @netObs, retPair) = {
+        new ch in {
+          for (@hAddr, @sH, @cAddr, @sC, @holderPurse, @cpPurse, res <= ch) {
+            new blk in {
+              blockNumberCh!(*blk) |
+              for (@b <- blk) {
+                if (b < T) { res!((false, "net-future: expiry not yet reached")) }
+                else {
+                  if (b > T) { res!((true, Nil)) }   // expired -> zero
+                  else {
+                    new obsCh in {
+                      @netObs!(*obsCh) |             // free feed (possibly composite)
+                      for (@net <- obsCh) {
+                        match net == 0 {
+                          true  => res!((true, Nil))
+                          false => match net > 0 {
+                            true => {                 // cp pays holder net
+                              new sp in {
+                                spend!(cpPurse, *sp) |
+                                for (@x <- sp) {
+                                  match x {
+                                    (false, m) => res!((false, ["net-future: cp unfunded:", m]))
+                                    (true, _)  => transfer!(RevVault, cAddr, hAddr, net, sC, *res)
+                                  }
+                                }
+                              }
+                            }
+                            false => {                // holder pays cp -net
+                              new sp in {
+                                spend!(holderPurse, *sp) |
+                                for (@x <- sp) {
+                                  match x {
+                                    (false, m) => res!((false, ["net-future: holder unfunded:", m]))
+                                    (true, _)  => transfer!(RevVault, hAddr, cAddr, 0 - net, sH, *res)
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } |
+          retPair!((*ch, 1))   // ONE transfer (conservative over direction)
+        }
+      } |
+
+      // Bilateral deployment boundary: reserve 1 token from EACH
+      // party's slot (direction unknown until T), fire, refund both.
+      contract acquireBilateral(
+        @nf, @hAddr, @sH, @holderSlot, @cAddr, @sC, @cpSlot, res
+      ) = {
+        new gate in {
+          reserve2!(holderSlot, sH, 1, cpSlot, sC, 1, *gate) |
+          for (@g <- gate) {
+            match g {
+              (false, why) => res!((false, ["bilateral rejected at gate:", why]))
+              (true, hP, cP) => {
+                new innerRes in {
+                  @nf!(hAddr, sH, cAddr, sC, hP, cP, *innerRes) |
+                  for (@out <- innerRes) {
+                    refund!(holderSlot, hP, Nil) | refund!(cpSlot, cP, Nil) | res!(out)
+                  }
+                }
+              }
+            }
+          }
+        }
+      } |
+
+      // Composite-observable helper: build a free feed that maps a
+      // source observable through an integer function. Used to form
+      // net observables (spot - F, heatRate*gas, cdd*tick). The
+      // composite's internal reads are free infrastructure; demand
+      // is unaffected (cost != amount).
+      new affineObs in {
+        // affineObs(srcObs, mul, add) -> obs returning mul*src + add
+        contract affineObs(@srcObs, @mul, @add, retObs) = {
+          new o in {
+            for (oRet <= o) {
+              new s in { @srcObs!(*s) | for (@v <- s) { oRet!(mul * v + add) } }
+            } |
+            retObs!(*o)
+          }
+        } |
+
+        // =======================================================
+        // 1. PPA  -- pattern D (strip) of pattern B (fixed legs)
+        // =======================================================
+        // A strip of fixed per-period payments. Each period is its
+        // OWN funded deployment at its own block (concurrent
+        // acceptance); we return the list of legs rather than a
+        // fused cand. Each leg = get(t, truncate(t, one(p))).
+        contract makePPA(@schedule, @pricePerPeriod, ret) = {
+          new build in {
+            contract build(@blocks, @acc, bret) = {
+              match blocks {
+                [] => bret!(acc)
+                [t ...rest] => {
+                  new onePair, truncPair, getPair in {
+                    makeOne!(pricePerPeriod, *onePair) |
+                    for (@(oneC, dOne) <- onePair) {
+                      makeTruncate!(t, oneC, dOne, *truncPair) |
+                      for (@(truncC, dTr) <- truncPair) {
+                        makeGet!(t, truncC, dTr, *getPair) |
+                        for (@(legC, dLeg) <- getPair) {
+                          build!(rest, acc ++ [{"block": t, "leg": *legC, "demand": dLeg}], *bret)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            new legsCh in {
+              build!(schedule, [], *legsCh) |
+              for (@legs <- legsCh) {
+                ret!({"type": "ppa", "pricePerPeriod": pricePerPeriod,
+                      "legs": legs, "note": "each leg acquired per-period (concurrent acceptance)"})
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 2. POWER FUTURES -- pattern A (netted)
+        // =======================================================
+        contract makePowerFutures(@T, @F, @spotObs, ret) = {
+          new netObsCh in {
+            affineObs!(spotObs, 1, 0 - F, *netObsCh) |   // net = spot - F
+            for (@netObs <- netObsCh) {
+              new nfPair in {
+                makeNetFuture!(T, netObs, *nfPair) |
+                for (@(nf, d) <- nfPair) {
+                  ret!({"type": "power-futures", "expiry": T, "F": F,
+                        "settle": *nf, "demand": d,
+                        "note": "bilateral: acquireBilateral(holderSlot, cpSlot)"})
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 3. SWING -- pattern D (strip) of pattern C (cor options)
+        // =======================================================
+        // Each interval: get(t, truncate(t, cor(one(floor), one(cap)))).
+        // Holder chooses floor/cap at the interval; demand per leg = 1
+        // (conservative max). Returned as independently-acquired legs.
+        contract makeSwing(@schedule, @floorCost, @capCost, ret) = {
+          new build in {
+            contract build(@blocks, @acc, bret) = {
+              match blocks {
+                [] => bret!(acc)
+                [t ...rest] => {
+                  new floorPair, capPair, corPair, truncPair, getPair in {
+                    makeOne!(floorCost, *floorPair) |
+                    makeOne!(capCost, *capPair) |
+                    for (@(fC, dF) <- floorPair; @(cC, dC) <- capPair) {
+                      makeCor!(fC, dF, cC, dC, *corPair) |
+                      for (@(corC, dCor) <- corPair) {
+                        makeTruncate!(t, corC, dCor, *truncPair) |
+                        for (@(trC, dTr) <- truncPair) {
+                          makeGet!(t, trC, dTr, *getPair) |
+                          for (@(legC, dLeg) <- getPair) {
+                            build!(rest, acc ++ [{"block": t, "leg": *legC, "demand": dLeg}], *bret)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            new legsCh in {
+              build!(schedule, [], *legsCh) |
+              for (@legs <- legsCh) {
+                ret!({"type": "swing", "floor": floorCost, "cap": capCost,
+                      "legs": legs,
+                      "note": "each interval acquired with choice=1(floor)/2(cap); unforced branch refunded"})
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 4. INTERRUPTIBLE -- pattern C (sold option), give-swapped
+        // =======================================================
+        // give(european(T, one(fee))). The grid holds the option;
+        // the DATA CENTRE is the writer and must keep its slot funded
+        // for the worst case (exercise). Demand 1, refunded if the
+        // option lapses (overcharge-and-refund).
+        contract makeInterruptible(@T, @curtailmentFee, ret) = {
+          new onePair, zeroLeg in {
+            // zero leg (cor's lapse branch): demand 0
+            new zch in {
+              for (_, _, _, _, _, res <= zch) { res!((true, Nil)) } |
+              zeroLeg!((*zch, 0))
+            } |
+            makeOne!(curtailmentFee, *onePair) |
+            for (@(oneC, dOne) <- onePair; @(zC, dZ) <- zeroLeg) {
+              new corPair, truncPair, getPair, givePair in {
+                makeCor!(oneC, dOne, zC, dZ, *corPair) |
+                for (@(corC, dCor) <- corPair) {
+                  makeTruncate!(T, corC, dCor, *truncPair) |
+                  for (@(trC, dTr) <- truncPair) {
+                    makeGet!(T, trC, dTr, *getPair) |
+                    for (@(getC, dG) <- getPair) {
+                      makeGive!(getC, dG, *givePair) |
+                      for (@(giveC, dGv) <- givePair) {
+                        ret!({"type": "interruptible", "expiry": T, "fee": curtailmentFee,
+                              "option": *giveC, "demand": dGv,
+                              "note": "data-centre writes the option; funds worst case, refunded on lapse"})
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 5. CAPACITY -- pattern B, give-swapped (data centre pays)
+        // =======================================================
+        contract makeCapacity(@T, @capacityPayment, ret) = {
+          new onePair, truncPair, getPair, givePair in {
+            makeOne!(capacityPayment, *onePair) |
+            for (@(oneC, dOne) <- onePair) {
+              makeTruncate!(T, oneC, dOne, *truncPair) |
+              for (@(trC, dTr) <- truncPair) {
+                makeGet!(T, trC, dTr, *getPair) |
+                for (@(getC, dG) <- getPair) {
+                  makeGive!(getC, dG, *givePair) |
+                  for (@(giveC, dGv) <- givePair) {
+                    ret!({"type": "capacity", "periodEnd": T, "fee": capacityPayment,
+                          "contract": *giveC, "demand": dGv})
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 6. REC FORWARD -- pattern B (zcb-shaped, demand 1)
+        // =======================================================
+        contract makeRECForward(@T, @recPrice, ret) = {
+          new onePair, truncPair, getPair in {
+            makeOne!(recPrice, *onePair) |
+            for (@(oneC, dOne) <- onePair) {
+              makeTruncate!(T, oneC, dOne, *truncPair) |
+              for (@(trC, dTr) <- truncPair) {
+                makeGet!(T, trC, dTr, *getPair) |
+                for (@(getC, dG) <- getPair) {
+                  ret!({"type": "rec-forward", "delivery": T, "price": recPrice,
+                        "contract": *getC, "demand": dG})
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 7. VIRTUAL PPA (CfD) -- pattern A (netted), == futures
+        // =======================================================
+        contract makeVirtualPPA(@T, @strike, @spotObs, ret) = {
+          new netObsCh in {
+            affineObs!(spotObs, 1, 0 - strike, *netObsCh) |   // net = spot - strike
+            for (@netObs <- netObsCh) {
+              new nfPair in {
+                makeNetFuture!(T, netObs, *nfPair) |
+                for (@(nf, d) <- nfPair) {
+                  ret!({"type": "virtual-ppa", "settlement": T, "strike": strike,
+                        "settle": *nf, "demand": d,
+                        "note": "CfD: one netted transfer; acquireBilateral"})
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 8. DEMAND RESPONSE -- pattern D (premium + option bundle)
+        // =======================================================
+        // The original fuses cand(one(standby), give(european(drPay))).
+        // These are NOT a simultaneous swap: the premium flows NOW
+        // (grid -> data centre), the option settles LATER at T (data
+        // centre -> grid, on exercise), and they are funded by
+        // DIFFERENT parties. We return them as two independent legs,
+        // each its own funded deployment (concurrent acceptance).
+        contract makeDemandResponse(@T, @standbyFee, @drPayment, ret) = {
+          new premiumPair, optionPair in {
+            // premium leg: grid (counterparty) pays data centre now
+            makeOne!(standbyFee, *premiumPair) |
+            // option leg: give(european(T, one(drPayment)))
+            new onePair, zeroLeg in {
+              new zch in {
+                for (_, _, _, _, _, res <= zch) { res!((true, Nil)) } | zeroLeg!((*zch, 0))
+              } |
+              makeOne!(drPayment, *onePair) |
+              for (@(oneC, dOne) <- onePair; @(zC, dZ) <- zeroLeg) {
+                new corPair, truncPair, getPair, givePair in {
+                  makeCor!(oneC, dOne, zC, dZ, *corPair) |
+                  for (@(corC, dCor) <- corPair) {
+                    makeTruncate!(T, corC, dCor, *truncPair) |
+                    for (@(trC, dTr) <- truncPair) {
+                      makeGet!(T, trC, dTr, *getPair) |
+                      for (@(getC, dG) <- getPair) {
+                        makeGive!(getC, dG, *givePair) |
+                        for (@(giveC, dGv) <- givePair;
+                             @(premC, dPrem) <- premiumPair) {
+                          ret!({
+                            "type": "demand-response", "expiry": T,
+                            "premiumLeg": *premC, "premiumDemand": dPrem,
+                            "premiumNote": "grid funds; settles at acquisition",
+                            "optionLeg": *giveC, "optionDemand": dGv,
+                            "optionNote": "data-centre writes/funds; settles at T on exercise",
+                            "bundleNote": "two independent deployments, not one atomic gate"
+                          })
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 9. FREQUENCY REGULATION STRIP -- pattern D of pattern C
+        // =======================================================
+        contract makeFreqRegStrip(@schedule, @upPayment, @downPayment, ret) = {
+          new build in {
+            contract build(@blocks, @acc, bret) = {
+              match blocks {
+                [] => bret!(acc)
+                [t ...rest] => {
+                  new upPair, downPair, corPair, truncPair, getPair in {
+                    makeOne!(upPayment, *upPair) |
+                    makeOne!(downPayment, *downPair) |
+                    for (@(uC, dU) <- upPair; @(dC, dD) <- downPair) {
+                      makeCor!(uC, dU, dC, dD, *corPair) |
+                      for (@(corC, dCor) <- corPair) {
+                        makeTruncate!(t, corC, dCor, *truncPair) |
+                        for (@(trC, dTr) <- truncPair) {
+                          makeGet!(t, trC, dTr, *getPair) |
+                          for (@(legC, dLeg) <- getPair) {
+                            build!(rest, acc ++ [{"block": t, "leg": *legC, "demand": dLeg}], *bret)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            new legsCh in {
+              build!(schedule, [], *legsCh) |
+              for (@legs <- legsCh) {
+                ret!({"type": "freq-reg", "up": upPayment, "down": downPayment,
+                      "legs": legs,
+                      "note": "per interval choose 1(up)/2(down); unforced branch refunded"})
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 10. SPINNING RESERVE -- pattern D (premium + option), == DR
+        // =======================================================
+        contract makeSpinningReserve(@T, @standbyFee, @reservePayment, ret) = {
+          new premiumPair in {
+            makeOne!(standbyFee, *premiumPair) |
+            new onePair, zeroLeg in {
+              new zch in {
+                for (_, _, _, _, _, res <= zch) { res!((true, Nil)) } | zeroLeg!((*zch, 0))
+              } |
+              makeOne!(reservePayment, *onePair) |
+              for (@(oneC, dOne) <- onePair; @(zC, dZ) <- zeroLeg) {
+                new corPair, truncPair, getPair, givePair in {
+                  makeCor!(oneC, dOne, zC, dZ, *corPair) |
+                  for (@(corC, dCor) <- corPair) {
+                    makeTruncate!(T, corC, dCor, *truncPair) |
+                    for (@(trC, dTr) <- truncPair) {
+                      makeGet!(T, trC, dTr, *getPair) |
+                      for (@(getC, dG) <- getPair) {
+                        makeGive!(getC, dG, *givePair) |
+                        for (@(giveC, dGv) <- givePair; @(premC, dPrem) <- premiumPair) {
+                          ret!({
+                            "type": "spinning-reserve", "expiry": T,
+                            "premiumLeg": *premC, "premiumDemand": dPrem,
+                            "optionLeg": *giveC, "optionDemand": dGv,
+                            "bundleNote": "premium now + option at T; two independent deployments"
+                          })
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 11. FORWARD CURVE STRIP -- pattern D of pattern A
+        // =======================================================
+        // A strip of bilateral netted futures across periods. Each
+        // period is its OWN bilateral settlement (acquireBilateral)
+        // at its block. Returned as independently-acquired bilateral
+        // legs.
+        contract makeForwardCurveStrip(@periods, @spotObs, ret) = {
+          new build in {
+            contract build(@ps, @acc, bret) = {
+              match ps {
+                [] => bret!(acc)
+                [(t, f) ...rest] => {
+                  new pfCh in {
+                    makePowerFutures!(t, f, spotObs, *pfCh) |
+                    for (@pf <- pfCh) {
+                      build!(rest,
+                        acc ++ [{"block": t, "F": f,
+                                 "settle": pf.get("settle"), "demand": pf.get("demand")}],
+                        *bret)
+                    }
+                  }
+                }
+              }
+            } |
+            new legsCh in {
+              build!(periods, [], *legsCh) |
+              for (@legs <- legsCh) {
+                ret!({"type": "forward-curve", "legs": legs,
+                      "note": "each period a bilateral netted future; acquireBilateral per period"})
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 12. SPARK SPREAD -- pattern A (netted), composite net obs
+        // =======================================================
+        // net = power - heatRate*gas. We build a composite free feed
+        // that reads both source observables and returns the signed
+        // spread; one netted transfer settles it. The composite's
+        // internal reads are free; demand stays 1 (cost != amount).
+        contract makeSparkSpread(@T, @heatRate, @powerObs, @gasObs, ret) = {
+          new netObsCh in {
+            // composite: net = power - heatRate*gas
+            new o in {
+              for (oRet <= o) {
+                new ps, gs in {
+                  @powerObs!(*ps) | @gasObs!(*gs) |
+                  for (@p <- ps; @g <- gs) { oRet!(p - heatRate * g) }
+                }
+              } |
+              netObsCh!(*o)
+            } |
+            for (@netObs <- netObsCh) {
+              new nfPair in {
+                makeNetFuture!(T, netObs, *nfPair) |
+                for (@(nf, d) <- nfPair) {
+                  ret!({"type": "spark-spread", "settlement": T, "heatRate": heatRate,
+                        "settle": *nf, "demand": d,
+                        "note": "net = power - heatRate*gas; one transfer; acquireBilateral"})
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 13. WEATHER DERIVATIVE -- pattern A (net >= 0, one-directional)
+        // =======================================================
+        // net = cdd * tick (>= 0): data centre receives. Reuses the
+        // netted settler (the holder-pays branch is simply never taken).
+        contract makeWeatherDerivative(@T, @tickValue, @cddObs, ret) = {
+          new netObsCh in {
+            affineObs!(cddObs, tickValue, 0, *netObsCh) |   // net = tick*cdd
+            for (@netObs <- netObsCh) {
+              new nfPair in {
+                makeNetFuture!(T, netObs, *nfPair) |
+                for (@(nf, d) <- nfPair) {
+                  ret!({"type": "weather-derivative", "settlement": T, "tick": tickValue,
+                        "settle": *nf, "demand": d,
+                        "note": "net = tick*CDD >= 0; one transfer; acquireBilateral"})
+                }
+              }
+            }
+          }
+        } |
+
+        // =======================================================
+        // 14. CRR -- pattern A (net >= 0, one-directional)
+        // =======================================================
+        // net = congestion spread (>= 0 by the floor convention):
+        // data centre receives the congestion rent in one transfer.
+        contract makeCRR(@T, @congestionSpreadObs, ret) = {
+          new nfPair in {
+            makeNetFuture!(T, congestionSpreadObs, *nfPair) |
+            for (@(nf, d) <- nfPair) {
+              ret!({"type": "crr", "settlement": T,
+                    "settle": *nf, "demand": d,
+                    "note": "net = spread >= 0; one transfer; acquireBilateral"})
+            }
+          }
+        } |
+
+        // =======================================================
+        // DEMO
+        // =======================================================
+        new
+          deployerId(`rho:rchain:deployerId`),
+          mockPowerSpotObs, mockGasObs, mockCDDObs, mockCongestionObs,
+          ppaCh, futuresCh, swingCh, interruptCh, capacityCh,
+          recCh, vppaCh, drCh, freqCh, reserveCh,
+          curveCh, sparkCh, weatherCh, crrCh
+        in {
+          // Mock observables (free feeds)
+          for (ret <= mockPowerSpotObs)  { ret!(750) } |
+          for (ret <= mockGasObs)        { ret!(300) } |
+          for (ret <= mockCDDObs)        { ret!(42)  } |
+          for (ret <= mockCongestionObs) { ret!(80)  } |
+
+          stdout!("=== Cost-accounted power-market instruments ===") |
+          stdout!("Pattern A (netted bilateral): futures, vPPA, spark, CRR, weather") |
+          stdout!("  acquire via acquireBilateral(holderSlot, cpSlot): 1 token/side, refund unused") |
+          stdout!("Pattern D (bundles): PPA/swing/freq/forward-curve legs, DR/reserve premium+option") |
+          stdout!("  each leg its own funded deployment (concurrent acceptance)") |
+
+          makePPA!([1000, 2000, 3000], 600, *ppaCh) |
+          for (@ppa <- ppaCh) { stdout!(["PPA legs:", ppa.get("legs")]) } |
+
+          makePowerFutures!(1000, 700, *mockPowerSpotObs, *futuresCh) |
+          for (@f <- futuresCh) { stdout!(["PowerFutures demand:", f.get("demand"), f.get("note")]) } |
+
+          makeSwing!([1000, 2000, 3000], 400, 900, *swingCh) |
+          for (@s <- swingCh) { stdout!(["Swing legs:", s.get("legs")]) } |
+
+          makeInterruptible!(1000, 200, *interruptCh) |
+          for (@i <- interruptCh) { stdout!(["Interruptible demand:", i.get("demand"), i.get("note")]) } |
+
+          makeCapacity!(3000, 1000, *capacityCh) |
+          for (@c <- capacityCh) { stdout!(["Capacity demand:", c.get("demand")]) } |
+
+          makeRECForward!(2000, 150, *recCh) |
+          for (@r <- recCh) { stdout!(["RECForward demand:", r.get("demand")]) } |
+
+          makeVirtualPPA!(1000, 700, *mockPowerSpotObs, *vppaCh) |
+          for (@v <- vppaCh) { stdout!(["VirtualPPA demand:", v.get("demand"), v.get("note")]) } |
+
+          makeDemandResponse!(1000, 50, 300, *drCh) |
+          for (@d <- drCh) { stdout!(["DemandResponse:", d.get("bundleNote")]) } |
+
+          makeFreqRegStrip!([1000, 2000, 3000], 100, 80, *freqCh) |
+          for (@fr <- freqCh) { stdout!(["FreqReg legs:", fr.get("legs")]) } |
+
+          makeSpinningReserve!(3000, 200, 500, *reserveCh) |
+          for (@sr <- reserveCh) { stdout!(["SpinningReserve:", sr.get("bundleNote")]) } |
+
+          makeForwardCurveStrip!([(1000, 700), (2000, 710), (3000, 720)], *mockPowerSpotObs, *curveCh) |
+          for (@cv <- curveCh) { stdout!(["ForwardCurve legs:", cv.get("legs")]) } |
+
+          makeSparkSpread!(1000, 7, *mockPowerSpotObs, *mockGasObs, *sparkCh) |
+          for (@sp <- sparkCh) { stdout!(["SparkSpread demand:", sp.get("demand"), sp.get("note")]) } |
+
+          makeWeatherDerivative!(3000, 10, *mockCDDObs, *weatherCh) |
+          for (@w <- weatherCh) { stdout!(["WeatherDerivative demand:", w.get("demand")]) } |
+
+          makeCRR!(1000, *mockCongestionObs, *crrCh) |
+          for (@cr <- crrCh) { stdout!(["CRR demand:", cr.get("demand"), cr.get("note")]) }
+        }
+      }
+    }
+  }
+}
