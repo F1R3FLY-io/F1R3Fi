@@ -1,0 +1,1068 @@
+// ============================================================
+// spj-power-contracts.rho
+//
+// Power Market Financial Instruments for a F1R3FLY Shard
+// managing data center grid connection and power supply.
+//
+// Based on SPJ combinator framework from spj-futures.rho.
+//
+// INSTRUMENTS IMPLEMENTED
+// -----------------------
+// Procurement:
+//   1.  makePPA          -- Power Purchase Agreement (fixed strip)
+//   2.  makePowerFutures -- Cash-settled futures on spot power
+//   3.  makeSwing        -- Swing contract (variable quantity strip)
+//   4.  makeInterruptible-- Interruptible supply (sold curtailment option)
+//   5.  makeCapacity     -- Capacity reservation contract
+//
+// Renewable / Carbon:
+//   6.  makeRECForward   -- Renewable Energy Certificate forward
+//   7.  makeVirtualPPA   -- Virtual PPA (contract for differences)
+//
+// Grid Services / Demand Response:
+//   8.  makeDemandResponse  -- Demand response option (sold to grid)
+//   9.  makeFreqRegStrip    -- Frequency regulation strip
+//   10. makeSpinningReserve -- Spinning reserve option (sold to grid)
+//
+// Resource Planning:
+//   11. makeForwardCurveStrip -- Strip of futures across billing periods
+//   12. makeSparkSpread       -- Spark spread (on-site generation signal)
+//   13. makeWeatherDerivative -- Cooling-degree-day swap
+//   14. makeCRR               -- Congestion Revenue Right
+//
+// CONVENTIONS
+// -----------
+// All monetary amounts are in nanoREV (Int).
+// Block numbers are used as the time axis.
+// Observables are persistent channels: for (ret <= obs) { ret!(value) }
+// Contract channel signature (uniform across all instruments):
+//
+//   C!(holderAddr, holderKey, counterpartyAddr, counterpartyKey, ret)
+//
+// ret receives (true, Nil) on success or (false, errMsg) on failure.
+// ============================================================
+
+new
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+
+  // SPJ combinators
+  makeZero, makeOne, makeGive, makeCand, makeCor,
+  makeTruncate, makeGet, makeScale,
+
+  // Power instrument constructors
+  makePPA,
+  makePowerFutures,
+  makeSwing,
+  makeInterruptible,
+  makeCapacity,
+  makeRECForward,
+  makeVirtualPPA,
+  makeDemandResponse,
+  makeFreqRegStrip,
+  makeSpinningReserve,
+  makeForwardCurveStrip,
+  makeSparkSpread,
+  makeWeatherDerivative,
+  makeCRR,
+
+  stdout(`rho:io:stdout`),
+  RevVaultCh
+
+in {
+
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // =========================================================
+    // HELPER: nanoREV transfer
+    // =========================================================
+    new transfer in {
+      contract transfer(
+        @RevVault,
+        @fromAddr, @toAddr,
+        @amount,
+        authKey,
+        ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) {
+            ret!((false, err))
+          }
+        }
+      } |
+
+      // =========================================================
+      // SPJ COMBINATORS (self-contained)
+      // =========================================================
+
+      contract makeZero(ret) = {
+        new zeroCh in {
+          for (_, _, _, res <= zeroCh) { res!((true, Nil)) } |
+          ret!(*zeroCh)
+        }
+      } |
+
+      contract makeOne(@amount, ret) = {
+        new oneCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= oneCh) {
+            transfer!(RevVault,
+              counterpartyAddr, holderAddr, amount,
+              *counterpartyKey, *res)
+          } |
+          ret!(*oneCh)
+        }
+      } |
+
+      contract makeGive(@innerC, ret) = {
+        new giveCh in {
+          for (
+            holderAddr, holderKey,
+            counterpartyAddr, counterpartyKey,
+            res
+          <= giveCh) {
+            @innerC!(*counterpartyAddr, *counterpartyKey,
+                     *holderAddr, *holderKey, *res)
+          } |
+          ret!(*giveCh)
+        }
+      } |
+
+      contract makeCand(@c1, @c2, ret) = {
+        new candCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= candCh) {
+            new res1, res2 in {
+              @c1!(holderAddr, *holderKey,
+                   counterpartyAddr, *counterpartyKey, *res1) |
+              @c2!(holderAddr, *holderKey,
+                   counterpartyAddr, *counterpartyKey, *res2) |
+              for (@r1 <- res1; @r2 <- res2) {
+                match (r1, r2) {
+                  ((true, _), (true, _)) => res!((true, Nil))
+                  ((false, e), _)        => res!((false, e))
+                  (_, (false, e))        => res!((false, e))
+                }
+              }
+            }
+          } |
+          ret!(*candCh)
+        }
+      } |
+
+      contract makeCor(@c1, @c2, ret) = {
+        new corCh in {
+          for (
+            @choice,
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= corCh) {
+            match choice {
+              1 => @c1!(holderAddr, *holderKey,
+                        counterpartyAddr, *counterpartyKey, *res)
+              2 => @c2!(holderAddr, *holderKey,
+                        counterpartyAddr, *counterpartyKey, *res)
+              _ => res!((false, "cor: invalid choice"))
+            }
+          } |
+          ret!(*corCh)
+        }
+      } |
+
+      contract makeTruncate(@horizon, @innerC, ret) = {
+        new truncCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= truncCh) {
+            new blockCh in {
+              blockNumberCh!(*blockCh) |
+              for (@currentBlock <- blockCh) {
+                if (currentBlock <= horizon) {
+                  @innerC!(holderAddr, *holderKey,
+                            counterpartyAddr, *counterpartyKey, *res)
+                } else { res!((true, Nil)) }
+              }
+            }
+          } |
+          ret!(*truncCh)
+        }
+      } |
+
+      contract makeGet(@horizon, @innerC, ret) = {
+        new getCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= getCh) {
+            new blockCh in {
+              blockNumberCh!(*blockCh) |
+              for (@currentBlock <- blockCh) {
+                if (currentBlock >= horizon) {
+                  @innerC!(holderAddr, *holderKey,
+                            counterpartyAddr, *counterpartyKey, *res)
+                } else {
+                  res!((false, "get: horizon not yet reached"))
+                }
+              }
+            }
+          } |
+          ret!(*getCh)
+        }
+      } |
+
+      contract makeScale(@obs, @innerC, ret) = {
+        new scaleCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= scaleCh) {
+            new obsCh in {
+              @obs!(*obsCh) |
+              for (@scaleFactor <- obsCh) {
+                new scaledOneCh in {
+                  makeOne!(scaleFactor, *scaledOneCh) |
+                  for (@scaledOne <- scaledOneCh) {
+                    @scaledOne!(holderAddr, *holderKey,
+                                counterpartyAddr, *counterpartyKey, *res)
+                  }
+                }
+              }
+            }
+          } |
+          ret!(*scaleCh)
+        }
+      } |
+
+      // =========================================================
+      // HELPER: fold a list of contract channels into a single
+      // cand chain. candFold!([c1,c2,...,cn], ret) builds
+      // cand(c1, cand(c2, ... cand(cn-1, cn) ...))
+      // =========================================================
+      new candFold in {
+        contract candFold(@contracts, ret) = {
+          match contracts {
+            [single] => ret!(single)
+            [head ...tail] => {
+              new tailCh in {
+                candFold!(tail, *tailCh) |
+                for (@tailContract <- tailCh) {
+                  makeCand!(head, tailContract, *ret)
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 1. POWER PURCHASE AGREEMENT (PPA)
+        // =========================================================
+        // A strip of fixed-price, fixed-quantity payments at each
+        // billing block in the schedule.
+        //
+        // makePPA(schedule, pricePerPeriod, ret)
+        //   schedule      :: [Int]  -- list of billing block numbers
+        //   pricePerPeriod :: Int   -- nanoREV per period (fixed)
+        //   ret            :: name  -- receives the PPA contract channel
+        //
+        // Algebraically:
+        //   ppa([t1,...,tn], p) =
+        //     cand(zcb(t1,p), cand(zcb(t2,p), ... zcb(tn,p) ...))
+        // =========================================================
+        contract makePPA(@schedule, @pricePerPeriod, ret) = {
+          new buildStrip in {
+            contract buildStrip(@blocks, stripRet) = {
+              match blocks {
+                [] => {
+                  // empty schedule: zero contract
+                  makeZero!(*stripRet)
+                }
+                [t ...rest] => {
+                  // zcb(t, pricePerPeriod) = get(t, truncate(t, one(p)))
+                  new oneCh, truncCh, getCh in {
+                    makeOne!(pricePerPeriod, *oneCh) |
+                    for (@oneC <- oneCh) {
+                      makeTruncate!(t, oneC, *truncCh) |
+                      for (@truncC <- truncCh) {
+                        makeGet!(t, truncC, *getCh) |
+                        for (@zcbC <- getCh) {
+                          match rest {
+                            [] => stripRet!(zcbC)
+                            _  => {
+                              new restCh in {
+                                buildStrip!(rest, *restCh) |
+                                for (@restC <- restCh) {
+                                  makeCand!(zcbC, restC, *stripRet)
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            buildStrip!(schedule, *ret)
+          }
+        } |
+
+        // =========================================================
+        // 2. POWER FUTURES
+        // =========================================================
+        // Cash-settled futures on spot power price.
+        // Holder (long) receives spot, pays futures price F.
+        // Net: holder receives (spot - F) nanoREV.
+        //
+        // makePowerFutures(T, F, spotObs, ret)
+        //   T       :: Int        -- expiry block
+        //   F       :: Int        -- futures price in nanoREV
+        //   spotObs :: Observable -- spot power price feed
+        //
+        // Algebraically:
+        //   powerFutures(T, F, spot) =
+        //     get(T, truncate(T, cand(scale(spot, one(1)),
+        //                             give(one(F)))))
+        // =========================================================
+        contract makePowerFutures(@T, @F, @spotObs, ret) = {
+          new oneUnitCh, leg1Ch, oneFCh, leg2Ch, bothCh, truncCh, getCh in {
+            makeOne!(1, *oneUnitCh) |
+            for (@oneUnit <- oneUnitCh) {
+              makeScale!(spotObs, oneUnit, *leg1Ch)
+            } |
+            makeOne!(F, *oneFCh) |
+            for (@oneF <- oneFCh) {
+              makeGive!(oneF, *leg2Ch)
+            } |
+            for (@leg1 <- leg1Ch; @leg2 <- leg2Ch) {
+              makeCand!(leg1, leg2, *bothCh) |
+              for (@both <- bothCh) {
+                makeTruncate!(T, both, *truncCh) |
+                for (@trunc <- truncCh) {
+                  makeGet!(T, trunc, *getCh) |
+                  for (@futures <- getCh) {
+                    ret!(futures)
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 3. SWING CONTRACT
+        // =========================================================
+        // At each interval t_i, holder chooses to take floor or
+        // cap quantity of power at a fixed price.
+        //
+        // makeSwing(schedule, floorCost, capCost, ret)
+        //   schedule  :: [Int] -- list of interval block numbers
+        //   floorCost :: Int   -- nanoREV for minimum take
+        //   capCost   :: Int   -- nanoREV for maximum take
+        //
+        // Each interval: cor(one(floorCost), one(capCost))
+        // Strip:         cand of all intervals
+        //
+        // Invocation: at each interval block the holder sends
+        //   choice=1 (floor) or choice=2 (cap) with the corCh.
+        // =========================================================
+        contract makeSwing(@schedule, @floorCost, @capCost, ret) = {
+          new buildSwing in {
+            contract buildSwing(@blocks, swingRet) = {
+              match blocks {
+                [] => makeZero!(*swingRet)
+                [t ...rest] => {
+                  new floorCh, capCh, corCh, truncCh, getCh in {
+                    makeOne!(floorCost, *floorCh) |
+                    makeOne!(capCost,   *capCh)   |
+                    for (@floorC <- floorCh; @capC <- capCh) {
+                      makeCor!(floorC, capC, *corCh) |
+                      for (@corC <- corCh) {
+                        makeTruncate!(t, corC, *truncCh) |
+                        for (@truncC <- truncCh) {
+                          makeGet!(t, truncC, *getCh) |
+                          for (@getC <- getCh) {
+                            match rest {
+                              [] => swingRet!(getC)
+                              _  => {
+                                new restCh in {
+                                  buildSwing!(rest, *restCh) |
+                                  for (@restC <- restCh) {
+                                    makeCand!(getC, restC, *swingRet)
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            buildSwing!(schedule, *ret)
+          }
+        } |
+
+        // =========================================================
+        // 4. INTERRUPTIBLE SUPPLY CONTRACT
+        // =========================================================
+        // Data center accepts curtailment risk from the grid in
+        // exchange for lower base rate. Grid operator holds a
+        // European option to interrupt; data center sells that
+        // option and receives a curtailment fee when exercised.
+        //
+        // makeInterruptible(T, curtailmentFee, ret)
+        //   T              :: Int -- option expiry block
+        //   curtailmentFee :: Int -- nanoREV paid to data center on exercise
+        //
+        // From the data center's perspective:
+        //   interruptible(T, fee) = give(european(T, one(fee)))
+        //
+        // i.e. the grid operator holds the option; the data center
+        // (as counterparty) pays fee if the option is exercised.
+        // =========================================================
+        contract makeInterruptible(@T, @curtailmentFee, ret) = {
+          new oneCh, corCh, zeroCh, truncCh, getCh, europeanCh, giveCh in {
+            makeOne!(curtailmentFee, *oneCh) |
+            makeZero!(*zeroCh) |
+            for (@oneC <- oneCh; @zeroC <- zeroCh) {
+              // european(T, one(fee)) = get(T, truncate(T, cor(one(fee), zero)))
+              makeCor!(oneC, zeroC, *corCh) |
+              for (@corC <- corCh) {
+                makeTruncate!(T, corC, *truncCh) |
+                for (@truncC <- truncCh) {
+                  makeGet!(T, truncC, *getCh) |
+                  for (@europeanC <- getCh) {
+                    // give flips parties: grid holds option, data center is counterparty
+                    makeGive!(europeanC, *giveCh) |
+                    for (@givenC <- giveCh) {
+                      ret!(givenC)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 5. CAPACITY RESERVATION CONTRACT
+        // =========================================================
+        // Data center pays a fixed fee to reserve N MW of capacity
+        // through a contract period ending at block T.
+        // Guarantees the right to draw up to N MW regardless of
+        // spot conditions.
+        //
+        // makeCapacity(T, capacityPayment, ret)
+        //   T               :: Int -- reservation period end block
+        //   capacityPayment :: Int -- nanoREV for the reservation
+        //
+        // Algebraically:
+        //   capacity(T, p) = give(get(T, truncate(T, one(p))))
+        //
+        // give: data center pays (is the counterparty paying one(p))
+        // =========================================================
+        contract makeCapacity(@T, @capacityPayment, ret) = {
+          new oneCh, truncCh, getCh, giveCh in {
+            makeOne!(capacityPayment, *oneCh) |
+            for (@oneC <- oneCh) {
+              makeTruncate!(T, oneC, *truncCh) |
+              for (@truncC <- truncCh) {
+                makeGet!(T, truncC, *getCh) |
+                for (@getC <- getCh) {
+                  makeGive!(getC, *giveCh) |
+                  for (@givenC <- giveCh) {
+                    ret!(givenC)
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 6. REC FORWARD
+        // =========================================================
+        // Forward purchase of a Renewable Energy Certificate at
+        // block T for fixed price recPrice nanoREV.
+        // Each REC certifies 1 MWh of renewable generation.
+        //
+        // makeRECForward(T, recPrice, ret)
+        //   T        :: Int -- delivery block
+        //   recPrice :: Int -- nanoREV per REC
+        //
+        // Algebraically:
+        //   recForward(T, p) = get(T, truncate(T, one(p)))
+        //
+        // Identical in structure to zcb; semantically the payment
+        // settles delivery of a REC (tracked off-chain or via a
+        // separate REC registry contract).
+        // =========================================================
+        contract makeRECForward(@T, @recPrice, ret) = {
+          new oneCh, truncCh, getCh in {
+            makeOne!(recPrice, *oneCh) |
+            for (@oneC <- oneCh) {
+              makeTruncate!(T, oneC, *truncCh) |
+              for (@truncC <- truncCh) {
+                makeGet!(T, truncC, *getCh) |
+                for (@getC <- getCh) {
+                  ret!(getC)
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 7. VIRTUAL PPA (Contract for Differences)
+        // =========================================================
+        // Data center pays generator a fixed strike price and
+        // receives spot power price in return. Separately buys
+        // physical power at spot from the grid. Net: pays strike.
+        //
+        // makeVirtualPPA(T, strike, spotObs, ret)
+        //   T       :: Int        -- settlement block
+        //   strike  :: Int        -- fixed price in nanoREV
+        //   spotObs :: Observable -- spot power price
+        //
+        // Algebraically (from data center's perspective as holder):
+        //   virtualPPA(T, K, spot) =
+        //     get(T, truncate(T, cand(scale(spot, one(1)),
+        //                             give(one(K)))))
+        //
+        // Same structure as powerFutures; different motivation
+        // (additionality / sustainability vs. price hedging).
+        // =========================================================
+        contract makeVirtualPPA(@T, @strike, @spotObs, ret) = {
+          // Identical construction to makePowerFutures
+          new oneUnitCh, leg1Ch, oneKCh, leg2Ch, bothCh, truncCh, getCh in {
+            makeOne!(1, *oneUnitCh) |
+            for (@oneUnit <- oneUnitCh) {
+              makeScale!(spotObs, oneUnit, *leg1Ch)
+            } |
+            makeOne!(strike, *oneKCh) |
+            for (@oneK <- oneKCh) {
+              makeGive!(oneK, *leg2Ch)
+            } |
+            for (@leg1 <- leg1Ch; @leg2 <- leg2Ch) {
+              makeCand!(leg1, leg2, *bothCh) |
+              for (@both <- bothCh) {
+                makeTruncate!(T, both, *truncCh) |
+                for (@trunc <- truncCh) {
+                  makeGet!(T, trunc, *getCh) |
+                  for (@vppa <- getCh) {
+                    ret!(vppa)
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 8. DEMAND RESPONSE OPTION
+        // =========================================================
+        // Grid operator pays data center to be available to curtail
+        // load on request. Data center sells a European call option
+        // on its load reduction capacity.
+        //
+        // makeDemandResponse(T, standbyFee, drPayment, ret)
+        //   T          :: Int -- option expiry block
+        //   standbyFee :: Int -- nanoREV premium paid upfront to data center
+        //   drPayment  :: Int -- nanoREV paid to data center on exercise
+        //
+        // Structure:
+        //   cand(
+        //     one(standbyFee),               -- data center receives premium now
+        //     give(european(T, one(drPayment))) -- grid holds exercise option
+        //   )
+        //
+        // give(european(...)): grid operator is the holder of the option;
+        // data center is the counterparty who pays on exercise.
+        // The upfront one(standbyFee) flows to the data center immediately.
+        // =========================================================
+        contract makeDemandResponse(@T, @standbyFee, @drPayment, ret) = {
+          new premiumCh,
+              drOneCh, zeroCh, corCh, truncCh, getCh, europeanCh, giveCh,
+              candCh in {
+            // Leg 1: data center receives standby premium immediately
+            makeOne!(standbyFee, *premiumCh) |
+            // Leg 2: grid holds option to call DR event
+            makeOne!(drPayment, *drOneCh) |
+            makeZero!(*zeroCh) |
+            for (@drOneC <- drOneCh; @zeroC <- zeroCh) {
+              makeCor!(drOneC, zeroC, *corCh) |
+              for (@corC <- corCh) {
+                makeTruncate!(T, corC, *truncCh) |
+                for (@truncC <- truncCh) {
+                  makeGet!(T, truncC, *getCh) |
+                  for (@europeanC <- getCh) {
+                    makeGive!(europeanC, *giveCh) |
+                    for (@givenC <- giveCh; @premiumC <- premiumCh) {
+                      makeCand!(premiumC, givenC, *candCh) |
+                      for (@drContract <- candCh) {
+                        ret!(drContract)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 9. FREQUENCY REGULATION STRIP
+        // =========================================================
+        // Data center modulates load each interval in response to
+        // grid frequency signals. At each interval, chooses between
+        // up-regulation (reduce load, receive upPayment) or
+        // down-regulation (increase load, receive downPayment).
+        //
+        // makeFreqRegStrip(schedule, upPayment, downPayment, ret)
+        //   schedule    :: [Int] -- list of regulation interval blocks
+        //   upPayment   :: Int   -- nanoREV received for load reduction
+        //   downPayment :: Int   -- nanoREV received for load increase
+        //
+        // Each interval: get(t, truncate(t, cor(one(upPayment),
+        //                                       one(downPayment))))
+        // Strip: cand of all intervals
+        //
+        // choice=1: up-regulation (reduce load)
+        // choice=2: down-regulation (increase load)
+        // =========================================================
+        contract makeFreqRegStrip(@schedule, @upPayment, @downPayment, ret) = {
+          new buildFreq in {
+            contract buildFreq(@blocks, freqRet) = {
+              match blocks {
+                [] => makeZero!(*freqRet)
+                [t ...rest] => {
+                  new upCh, downCh, corCh, truncCh, getCh in {
+                    makeOne!(upPayment,   *upCh)   |
+                    makeOne!(downPayment, *downCh) |
+                    for (@upC <- upCh; @downC <- downCh) {
+                      makeCor!(upC, downC, *corCh) |
+                      for (@corC <- corCh) {
+                        makeTruncate!(t, corC, *truncCh) |
+                        for (@truncC <- truncCh) {
+                          makeGet!(t, truncC, *getCh) |
+                          for (@getC <- getCh) {
+                            match rest {
+                              [] => freqRet!(getC)
+                              _  => {
+                                new restCh in {
+                                  buildFreq!(rest, *restCh) |
+                                  for (@restC <- restCh) {
+                                    makeCand!(getC, restC, *freqRet)
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            buildFreq!(schedule, *ret)
+          }
+        } |
+
+        // =========================================================
+        // 10. SPINNING RESERVE CONTRACT
+        // =========================================================
+        // Data center with on-site generation sells spinning reserve:
+        // a commitment to inject power within 10 minutes if called.
+        // Grid pays standby fee; data center is paid reservePayment
+        // if the option is exercised (grid calls on the reserve).
+        //
+        // makeSpinningReserve(T, standbyFee, reservePayment, ret)
+        //   T              :: Int -- contract period end block
+        //   standbyFee     :: Int -- nanoREV paid upfront to data center
+        //   reservePayment :: Int -- nanoREV paid on exercise
+        //
+        // Structure:
+        //   cand(
+        //     one(standbyFee),
+        //     give(european(T, one(reservePayment)))
+        //   )
+        //
+        // Structurally identical to demandResponse; separate
+        // constructor for semantic clarity and different parameterisation.
+        // =========================================================
+        contract makeSpinningReserve(@T, @standbyFee, @reservePayment, ret) = {
+          new standbyCh,
+              resOneCh, zeroCh, corCh, truncCh, getCh, giveCh, candCh in {
+            makeOne!(standbyFee,     *standbyCh) |
+            makeOne!(reservePayment, *resOneCh)  |
+            makeZero!(*zeroCh) |
+            for (@resOneC <- resOneCh; @zeroC <- zeroCh) {
+              makeCor!(resOneC, zeroC, *corCh) |
+              for (@corC <- corCh) {
+                makeTruncate!(T, corC, *truncCh) |
+                for (@truncC <- truncCh) {
+                  makeGet!(T, truncC, *getCh) |
+                  for (@europeanC <- getCh) {
+                    makeGive!(europeanC, *giveCh) |
+                    for (@givenC <- giveCh; @standbyC <- standbyCh) {
+                      makeCand!(standbyC, givenC, *candCh) |
+                      for (@reserveContract <- candCh) {
+                        ret!(reserveContract)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 11. FORWARD CURVE STRIP
+        // =========================================================
+        // A sequence of futures contracts across billing periods,
+        // locking in the power cost profile for capacity planning.
+        //
+        // makeForwardCurveStrip(periods, spotObs, ret)
+        //   periods :: [(Int, Int)]  -- list of (block, futuresPrice) pairs
+        //   spotObs :: Observable    -- spot power price feed
+        //
+        // Strip: cand(futures(T1,F1,spot),
+        //              cand(futures(T2,F2,spot), ... ))
+        // =========================================================
+        contract makeForwardCurveStrip(@periods, @spotObs, ret) = {
+          new buildCurve in {
+            contract buildCurve(@ps, curveRet) = {
+              match ps {
+                [] => makeZero!(*curveRet)
+                [(t, f) ...rest] => {
+                  new futCh in {
+                    makePowerFutures!(t, f, spotObs, *futCh) |
+                    for (@futC <- futCh) {
+                      match rest {
+                        [] => curveRet!(futC)
+                        _  => {
+                          new restCh in {
+                            buildCurve!(rest, *restCh) |
+                            for (@restC <- restCh) {
+                              makeCand!(futC, restC, *curveRet)
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } |
+            buildCurve!(periods, *ret)
+          }
+        } |
+
+        // =========================================================
+        // 12. SPARK SPREAD CONTRACT
+        // =========================================================
+        // Payoff when on-site generation is profitable:
+        //   power price - (gas price * heat rate) > 0
+        //
+        // Data center receives power price and pays gas cost.
+        // Used to decide when to run on-site generation vs. grid.
+        //
+        // makeSparkSpread(T, heatRate, powerObs, gasObs, ret)
+        //   T        :: Int        -- settlement block
+        //   heatRate :: Int        -- MMBtu per MWh (integer approximation)
+        //   powerObs :: Observable -- power spot price in nanoREV/MWh
+        //   gasObs   :: Observable -- gas price in nanoREV/MMBtu
+        //
+        // Algebraically:
+        //   sparkSpread(T, hr, power, gas) =
+        //     get(T, truncate(T, cand(scale(power, one(1)),
+        //                             give(scale(gas, one(heatRate))))))
+        //
+        // Note: give(scale(gas, one(heatRate))) pays heatRate * gasPrice
+        // from the data center to the counterparty (gas supplier).
+        // Net: data center receives powerPrice - heatRate * gasPrice.
+        // =========================================================
+        contract makeSparkSpread(@T, @heatRate, @powerObs, @gasObs, ret) = {
+          new oneUnitCh, powerLegCh,
+              oneHRCh, gasScaleCh, gasLegCh,
+              bothCh, truncCh, getCh in {
+            // Power leg: receive power price
+            makeOne!(1, *oneUnitCh) |
+            for (@oneUnit <- oneUnitCh) {
+              makeScale!(powerObs, oneUnit, *powerLegCh)
+            } |
+            // Gas leg: pay heatRate units scaled by gas price
+            // We build a composite observable that returns heatRate * gasPrice
+            // via a wrapper channel
+            new gasCompositeObs in {
+              for (obsRet <= gasCompositeObs) {
+                new gasCh in {
+                  @gasObs!(*gasCh) |
+                  for (@gasPrice <- gasCh) {
+                    obsRet!(heatRate * gasPrice)
+                  }
+                }
+              } |
+              makeOne!(1, *oneHRCh) |
+              for (@oneHR <- oneHRCh) {
+                makeScale!(gasCompositeObs, oneHR, *gasScaleCh) |
+                for (@gasScaleC <- gasScaleCh) {
+                  makeGive!(gasScaleC, *gasLegCh)
+                }
+              } |
+              for (@powerLeg <- powerLegCh; @gasLeg <- gasLegCh) {
+                makeCand!(powerLeg, gasLeg, *bothCh) |
+                for (@both <- bothCh) {
+                  makeTruncate!(T, both, *truncCh) |
+                  for (@trunc <- truncCh) {
+                    makeGet!(T, trunc, *getCh) |
+                    for (@spark <- getCh) {
+                      ret!(spark)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 13. WEATHER DERIVATIVE (Cooling Degree Day Swap)
+        // =========================================================
+        // Pays out when accumulated cooling degree days (CDD) exceed
+        // a threshold, offsetting higher cooling power costs.
+        //
+        // makeWeatherDerivative(T, tickValue, cddObs, ret)
+        //   T         :: Int        -- settlement block (end of season)
+        //   tickValue :: Int        -- nanoREV per CDD above threshold
+        //   cddObs    :: Observable -- accumulated CDD above threshold
+        //
+        // Algebraically:
+        //   weatherDeriv(T, tick, cdd) =
+        //     get(T, truncate(T, scale(cdd, one(tick))))
+        //
+        // cddObs returns the total accumulated CDD above the agreed
+        // threshold at settlement. Positive CDD means hot season;
+        // payout offsets the higher cooling cost.
+        // =========================================================
+        contract makeWeatherDerivative(@T, @tickValue, @cddObs, ret) = {
+          new oneTickCh, scaleCh, truncCh, getCh in {
+            makeOne!(tickValue, *oneTickCh) |
+            for (@oneTick <- oneTickCh) {
+              makeScale!(cddObs, oneTick, *scaleCh) |
+              for (@scaleC <- scaleCh) {
+                makeTruncate!(T, scaleC, *truncCh) |
+                for (@truncC <- truncCh) {
+                  makeGet!(T, truncC, *getCh) |
+                  for (@wdContract <- getCh) {
+                    ret!(wdContract)
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // 14. CONGESTION REVENUE RIGHT (CRR)
+        // =========================================================
+        // Pays out when transmission congestion creates a price
+        // spread between the injection node (generator) and
+        // withdrawal node (data center).
+        //
+        // makeCRR(T, congestionSpreadObs, ret)
+        //   T                   :: Int        -- settlement block
+        //   congestionSpreadObs :: Observable -- price diff between
+        //                                        source and sink nodes
+        //                                        in nanoREV
+        //
+        // Algebraically:
+        //   crr(T, spread) =
+        //     get(T, truncate(T, scale(spread, one(1))))
+        //
+        // If spread > 0, data center receives the congestion rent.
+        // If spread = 0, no payment (no congestion).
+        // Negative spread is handled externally (CRR is a right,
+        // not an obligation; in practice a floor of zero applies,
+        // modelled here by the observable returning max(spread, 0)).
+        // =========================================================
+        contract makeCRR(@T, @congestionSpreadObs, ret) = {
+          new oneUnitCh, scaleCh, truncCh, getCh in {
+            makeOne!(1, *oneUnitCh) |
+            for (@oneUnit <- oneUnitCh) {
+              makeScale!(congestionSpreadObs, oneUnit, *scaleCh) |
+              for (@scaleC <- scaleCh) {
+                makeTruncate!(T, scaleC, *truncCh) |
+                for (@truncC <- truncCh) {
+                  makeGet!(T, truncC, *getCh) |
+                  for (@crrContract <- getCh) {
+                    ret!(crrContract)
+                  }
+                }
+              }
+            }
+          }
+        } |
+
+        // =========================================================
+        // DEMO
+        // =========================================================
+        // Builds example instances of each instrument.
+        // Observables use mock values; in production replace with
+        // registered price feed contracts on the shard.
+        //
+        // Block schedule (illustrative):
+        //   Period 1 end: block 1000
+        //   Period 2 end: block 2000
+        //   Period 3 end: block 3000
+        //
+        // All prices in nanoREV. 1 REV = 1e8 nanoREV.
+        // =========================================================
+
+        new
+          deployerId(`rho:rchain:deployerId`),
+          counterpartyKeyCh,
+
+          // Mock observables
+          mockPowerSpotObs,   // power spot price: 750 nanoREV/MWh
+          mockGasObs,         // gas price: 300 nanoREV/MMBtu
+          mockCDDObs,         // accumulated CDD above threshold: 42
+          mockCongestionObs,  // congestion spread: 80 nanoREV
+
+          // Result channels for each instrument
+          ppaCh, futuresCh, swingCh, interruptCh, capacityCh,
+          recCh, vppa_Ch, drCh, freqCh, reserveCh,
+          curveCh, sparkCh, weatherCh, crrCh
+
+        in {
+
+          // --- Mock observables ---
+          for (ret <= mockPowerSpotObs)  { ret!(750)  } |
+          for (ret <= mockGasObs)        { ret!(300)  } |
+          for (ret <= mockCDDObs)        { ret!(42)   } |
+          for (ret <= mockCongestionObs) { ret!(80)   } |
+
+          @RevVault!("deployerAuthKey", *deployerId, *counterpartyKeyCh) |
+          for (counterpartyKey <- counterpartyKeyCh) {
+
+            // 1. PPA: 3 billing periods, 600 nanoREV each
+            makePPA!([1000, 2000, 3000], 600, *ppaCh) |
+            for (@ppa <- ppaCh) {
+              stdout!(["PPA built", "periods: 1000,2000,3000", "price/period: 600 nanoREV"])
+            } |
+
+            // 2. Power Futures: expiry block 1000, futures price 700
+            makePowerFutures!(1000, 700, *mockPowerSpotObs, *futuresCh) |
+            for (@futures <- futuresCh) {
+              stdout!(["PowerFutures built", "expiry: 1000", "F: 700 nanoREV"])
+            } |
+
+            // 3. Swing: 3 intervals, floor 400 nanoREV, cap 900 nanoREV
+            makeSwing!([1000, 2000, 3000], 400, 900, *swingCh) |
+            for (@swing <- swingCh) {
+              stdout!(["Swing built", "intervals: 1000,2000,3000",
+                       "floor: 400 nanoREV", "cap: 900 nanoREV"])
+            } |
+
+            // 4. Interruptible: expiry 1000, curtailment fee 200 nanoREV
+            makeInterruptible!(1000, 200, *interruptCh) |
+            for (@interrupt <- interruptCh) {
+              stdout!(["Interruptible built", "expiry: 1000", "curtailmentFee: 200 nanoREV"])
+            } |
+
+            // 5. Capacity: block 3000, reservation fee 1000 nanoREV
+            makeCapacity!(3000, 1000, *capacityCh) |
+            for (@capacity <- capacityCh) {
+              stdout!(["Capacity built", "period end: 3000", "fee: 1000 nanoREV"])
+            } |
+
+            // 6. REC Forward: delivery block 2000, 150 nanoREV per REC
+            makeRECForward!(2000, 150, *recCh) |
+            for (@rec <- recCh) {
+              stdout!(["RECForward built", "delivery: 2000", "price: 150 nanoREV"])
+            } |
+
+            // 7. Virtual PPA: settlement 1000, strike 700, spot observable
+            makeVirtualPPA!(1000, 700, *mockPowerSpotObs, *vppa_Ch) |
+            for (@vppa <- vppa_Ch) {
+              stdout!(["VirtualPPA built", "settlement: 1000", "strike: 700 nanoREV"])
+            } |
+
+            // 8. Demand Response: expiry 1000, standby 50, DR payment 300
+            makeDemandResponse!(1000, 50, 300, *drCh) |
+            for (@dr <- drCh) {
+              stdout!(["DemandResponse built", "expiry: 1000",
+                       "standby: 50 nanoREV", "drPayment: 300 nanoREV"])
+            } |
+
+            // 9. Frequency Regulation: 3 intervals, up 100, down 80 nanoREV
+            makeFreqRegStrip!([1000, 2000, 3000], 100, 80, *freqCh) |
+            for (@freq <- freqCh) {
+              stdout!(["FreqReg built", "intervals: 1000,2000,3000",
+                       "up: 100 nanoREV", "down: 80 nanoREV"])
+            } |
+
+            // 10. Spinning Reserve: expiry 3000, standby 200, reserve 500
+            makeSpinningReserve!(3000, 200, 500, *reserveCh) |
+            for (@reserve <- reserveCh) {
+              stdout!(["SpinningReserve built", "expiry: 3000",
+                       "standby: 200 nanoREV", "reservePayment: 500 nanoREV"])
+            } |
+
+            // 11. Forward Curve Strip: 3 periods with different futures prices
+            makeForwardCurveStrip!(
+              [(1000, 700), (2000, 710), (3000, 720)],
+              *mockPowerSpotObs,
+              *curveCh
+            ) |
+            for (@curve <- curveCh) {
+              stdout!(["ForwardCurveStrip built", "periods: (1000,700),(2000,710),(3000,720)"])
+            } |
+
+            // 12. Spark Spread: settlement 1000, heat rate 7, power+gas obs
+            makeSparkSpread!(1000, 7, *mockPowerSpotObs, *mockGasObs, *sparkCh) |
+            for (@spark <- sparkCh) {
+              stdout!(["SparkSpread built", "settlement: 1000",
+                       "heatRate: 7", "powerObs: mock 750", "gasObs: mock 300"])
+            } |
+
+            // 13. Weather Derivative: settlement 3000, tick 10 nanoREV/CDD
+            makeWeatherDerivative!(3000, 10, *mockCDDObs, *weatherCh) |
+            for (@weather <- weatherCh) {
+              stdout!(["WeatherDerivative built", "settlement: 3000",
+                       "tick: 10 nanoREV/CDD", "CDD obs: mock 42"])
+            } |
+
+            // 14. CRR: settlement 1000, congestion spread observable
+            makeCRR!(1000, *mockCongestionObs, *crrCh) |
+            for (@crr <- crrCh) {
+              stdout!(["CRR built", "settlement: 1000", "congestionSpread obs: mock 80 nanoREV"])
+            }
+          }
+        }
+      }
+    }
+  }
+}

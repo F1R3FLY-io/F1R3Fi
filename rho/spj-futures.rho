@@ -1,0 +1,396 @@
+// ============================================================
+// spj-futures.rho
+//
+// Futures Contract using SPJ Financial Contract Combinators
+// Based on "Composing Contracts: An Adventure in Financial
+// Engineering" by Peyton Jones, Eber & Seward (ICFP 2000)
+//
+// Depends on the combinator infrastructure defined in the
+// F1R3Fi combinator file (makeOne, makeGive, makeCand,
+// makeTruncate, makeGet, makeScale, makeZero).
+//
+// CASH-SETTLED FUTURES
+// --------------------
+// A futures contract obligates both parties at expiry block T:
+//   Holder (long)        receives spot price in nanoREV
+//   Counterparty (short) receives futures price F in nanoREV
+//
+// Net economic effect for the long:
+//   spot > F  =>  holder receives (spot - F) nanoREV
+//   spot < F  =>  holder pays    (F - spot) nanoREV
+//
+// Algebraically:
+//
+//   futures(T, F, spotObs) =
+//     get(T, truncate(T, cand(scale(spotObs, one(1)),
+//                             give(one(F)))))
+//
+// spotObs  :: Observable  -- channel that returns spot price
+//                            in nanoREV when sent a ret channel
+// F        :: Int         -- agreed futures price in nanoREV
+// T        :: Int         -- expiry block number
+//
+// CONTRACT CHANNEL SIGNATURE (same as all SPJ combinators):
+//
+//   futuresContract!(holderAddr, holderKey,
+//                    counterpartyAddr, counterpartyKey,
+//                    ret)
+//
+// ret receives (true, Nil) on success or (false, errMsg)
+// on failure.
+//
+// TIMING
+// ------
+// The get(T, ...) wrapper means the contract returns an error
+// if invoked before block T. A watcher process (off-chain
+// scheduler or on-chain alarm) is responsible for invoking
+// the returned contract at block T.
+//
+// The truncate(T, ...) wrapper means the contract becomes
+// zero (does nothing, returns success) if invoked after T.
+//
+// SPOT ORACLE
+// -----------
+// spotObs must be a persistent observable channel:
+//
+//   for (obsRet <= spotObs) { obsRet!(currentPrice) }
+//
+// In production this is a price feed contract. A mock oracle
+// is provided in the demo section at the bottom.
+// ============================================================
+
+new
+  // System channels
+  rl(`rho:registry:lookup`),
+  blockNumberCh(`rho:block:number`),
+
+  // SPJ combinator constructors (assumed in scope from
+  // spj-combinators.rho; redeclared here for standalone use)
+  makeZero, makeOne, makeGive, makeCand, makeCor,
+  makeTruncate, makeGet, makeScaleK, makeScale,
+  makeEuropean, makeZcb,
+
+  // Futures constructor
+  makeFutures,
+
+  // Demo
+  stdout(`rho:io:stdout`),
+  RevVaultCh
+
+in {
+
+  // -------------------------------------------------------
+  // Bootstrap: look up RevVault once.
+  // -------------------------------------------------------
+  rl!(`rho:rchain:revVault`, *RevVaultCh) |
+
+  for (@(_, RevVault) <- RevVaultCh) {
+
+    // =====================================================
+    // HELPER: transfer nanoREV (copied from spj-combinators)
+    // =====================================================
+    new transfer in {
+      contract transfer(
+        @RevVault,
+        @fromAddr, @toAddr,
+        @amount,
+        authKey,
+        ret
+      ) = {
+        new vaultCh in {
+          @RevVault!("findOrCreate", fromAddr, *vaultCh) |
+          for (@(true, vault) <- vaultCh) {
+            @vault!("transfer", toAddr, amount, *authKey, *ret)
+          } |
+          for (@(false, err) <- vaultCh) {
+            ret!((false, err))
+          }
+        }
+      } |
+
+      // =====================================================
+      // Combinator definitions
+      // (Inline here so this file is self-contained;
+      //  in production, import from spj-combinators.rho)
+      // =====================================================
+
+      contract makeZero(ret) = {
+        new zeroCh in {
+          for (holderVault, holderKey,
+               counterpartyVault, res
+          <= zeroCh) {
+            res!((true, Nil))
+          } |
+          ret!(*zeroCh)
+        }
+      } |
+
+      contract makeOne(@amount, ret) = {
+        new oneCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= oneCh) {
+            transfer!(
+              RevVault,
+              counterpartyAddr, holderAddr,
+              amount,
+              *counterpartyKey,
+              *res
+            )
+          } |
+          ret!(*oneCh)
+        }
+      } |
+
+      contract makeGive(@innerC, ret) = {
+        new giveCh in {
+          for (
+            holderAddr, holderKey,
+            counterpartyAddr, counterpartyKey,
+            res
+          <= giveCh) {
+            @innerC!(*counterpartyAddr, *counterpartyKey,
+                     *holderAddr, *holderKey,
+                     *res)
+          } |
+          ret!(*giveCh)
+        }
+      } |
+
+      contract makeCand(@c1, @c2, ret) = {
+        new candCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= candCh) {
+            new res1, res2 in {
+              @c1!(holderAddr, *holderKey,
+                   counterpartyAddr, *counterpartyKey,
+                   *res1) |
+              @c2!(holderAddr, *holderKey,
+                   counterpartyAddr, *counterpartyKey,
+                   *res2) |
+              for (@r1 <- res1; @r2 <- res2) {
+                match (r1, r2) {
+                  ((true, _), (true, _)) => res!((true, Nil))
+                  ((false, e), _)        => res!((false, e))
+                  (_, (false, e))        => res!((false, e))
+                }
+              }
+            }
+          } |
+          ret!(*candCh)
+        }
+      } |
+
+      contract makeTruncate(@horizon, @innerC, ret) = {
+        new truncCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= truncCh) {
+            new blockCh in {
+              blockNumberCh!(*blockCh) |
+              for (@currentBlock <- blockCh) {
+                if (currentBlock <= horizon) {
+                  @innerC!(holderAddr, *holderKey,
+                            counterpartyAddr, *counterpartyKey,
+                            *res)
+                } else {
+                  res!((true, Nil))
+                }
+              }
+            }
+          } |
+          ret!(*truncCh)
+        }
+      } |
+
+      contract makeGet(@horizon, @innerC, ret) = {
+        new getCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= getCh) {
+            new blockCh in {
+              blockNumberCh!(*blockCh) |
+              for (@currentBlock <- blockCh) {
+                if (currentBlock >= horizon) {
+                  @innerC!(holderAddr, *holderKey,
+                            counterpartyAddr, *counterpartyKey,
+                            *res)
+                } else {
+                  res!((false, "get: horizon not yet reached"))
+                }
+              }
+            }
+          } |
+          ret!(*getCh)
+        }
+      } |
+
+      contract makeScale(@obs, @innerC, ret) = {
+        new scaleCh in {
+          for (
+            @holderAddr, holderKey,
+            @counterpartyAddr, counterpartyKey,
+            res
+          <= scaleCh) {
+            new obsCh in {
+              @obs!(*obsCh) |
+              for (@scaleFactor <- obsCh) {
+                new scaledOneCh in {
+                  makeOne!(scaleFactor, *scaledOneCh) |
+                  for (@scaledOne <- scaledOneCh) {
+                    @scaledOne!(holderAddr, *holderKey,
+                                counterpartyAddr, *counterpartyKey,
+                                *res)
+                  }
+                }
+              }
+            }
+          } |
+          ret!(*scaleCh)
+        }
+      } |
+
+      // =====================================================
+      // makeFutures :: Int -> Int -> Observable -> Contract
+      //
+      // futures(T, F, spotObs) =
+      //   get(T, truncate(T, cand(scale(spotObs, one(1)),
+      //                           give(one(F)))))
+      //
+      // Parameters:
+      //   T       -- expiry block number
+      //   F       -- futures price in nanoREV
+      //   spotObs -- observable channel for spot price
+      //   ret     -- receives the constructed contract channel
+      // =====================================================
+      contract makeFutures(@T, @F, @spotObs, ret) = {
+
+        // Leg 1: holder receives spot nanoREV
+        //   scale(spotObs, one(1))
+        new oneUnitCh, leg1Ch in {
+          makeOne!(1, *oneUnitCh) |
+          for (@oneUnit <- oneUnitCh) {
+            makeScale!(spotObs, oneUnit, *leg1Ch)
+          } |
+
+          for (@leg1 <- leg1Ch) {
+
+            // Leg 2: holder pays futures price F nanoREV
+            //   give(one(F))
+            new oneFCh, leg2Ch in {
+              makeOne!(F, *oneFCh) |
+              for (@oneF <- oneFCh) {
+                makeGive!(oneF, *leg2Ch)
+              } |
+
+              for (@leg2 <- leg2Ch) {
+
+                // Both legs in parallel: cand(leg1, leg2)
+                new bothLegsCh in {
+                  makeCand!(leg1, leg2, *bothLegsCh) |
+
+                  for (@bothLegs <- bothLegsCh) {
+
+                    // Expire if not triggered by T: truncate(T, bothLegs)
+                    new truncCh in {
+                      makeTruncate!(T, bothLegs, *truncCh) |
+
+                      for (@truncContract <- truncCh) {
+
+                        // Acquire at block T: get(T, truncContract)
+                        new innerGetCh in {
+                          makeGet!(T, truncContract, *innerGetCh) |
+
+                          for (@futuresContract <- innerGetCh) {
+                            ret!(futuresContract)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } |
+
+      // =====================================================
+      // DEMO
+      // =====================================================
+      // Builds a cash-settled futures contract:
+      //   expiry block T = 200
+      //   futures price  F = 700 nanoREV
+      //   spot oracle returns 750 nanoREV (mock)
+      //
+      // Net settlement: holder receives 50 nanoREV
+      // (spot 750 - futures price 700)
+      //
+      // In production:
+      //   - Replace mock oracle with a registered price feed
+      //   - Replace addresses with real REV addresses
+      //   - Replace keys with real deployer auth keys
+      //   - Invoke the returned contract at block T via
+      //     an on-chain watcher or scheduled deployment
+      // =====================================================
+
+      new
+        deployerId(`rho:rchain:deployerId`),
+        counterpartyKeyCh,
+        spotOracle,
+        futuresCh,
+        demoRet
+      in {
+
+        // Mock spot oracle: always reports 750 nanoREV.
+        // Replace with a real price feed in production.
+        for (obsRet <= spotOracle) {
+          obsRet!(750)
+        } |
+
+        @RevVault!("deployerAuthKey", *deployerId, *counterpartyKeyCh) |
+
+        for (counterpartyKey <- counterpartyKeyCh) {
+
+          stdout!("Building futures contract: expiry block 200, futures price 700 nanoREV") |
+
+          makeFutures!(200, 700, *spotOracle, *futuresCh) |
+
+          for (@futuresContract <- futuresCh) {
+
+            stdout!("Futures contract built.") |
+            stdout!("Invoke at block 200:") |
+            stdout!("  futuresContract!(holderAddr, holderKey, counterpartyAddr, counterpartyKey, ret)") |
+
+            // Demo invocation (will return "horizon not yet reached"
+            // unless current block >= 200)
+            new demoRes in {
+              futuresContract!(
+                "11112abc...holderRevAddress",
+                *counterpartyKey,
+                "11112def...counterpartyRevAddress",
+                *counterpartyKey,
+                *demoRes
+              ) |
+              for (@result <- demoRes) {
+                match result {
+                  (true, _)    => stdout!("Futures settled successfully")
+                  (false, msg) => stdout!(["Futures result: ", msg])
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
